@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: citation-generator
+Version: 0.1.0
+Summary: Backend for citation generator
+Author: You
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi<1,>=0.111.0
+Requires-Dist: uvicorn[standard]<1,>=0.30.0
+Requires-Dist: SQLAlchemy<3,>=2.0.30
+Requires-Dist: psycopg[binary]<4,>=3.1.12
+Requires-Dist: alembic<2,>=1.13.2
+Requires-Dist: pydantic<3,>=2.7.0
+Requires-Dist: pydantic-settings<3,>=2.2.1
+Requires-Dist: python-jose[cryptography]<4,>=3.3.0
+Requires-Dist: passlib[bcrypt]<2,>=1.7.4
+Requires-Dist: email-validator>=2.1.0
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: bcrypt<5,>=4.1.2
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: black>=24.4; extra == "dev"
+Requires-Dist: ruff>=0.4.2; extra == "dev"
+Requires-Dist: pylint>=3.2.2; extra == "dev"
+Requires-Dist: mypy>=1.10.0; extra == "dev"
+
+# citation_generator

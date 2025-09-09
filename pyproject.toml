@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "citation-generator"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Backend for citation generator"
+readme = "README.md"
+authors = [{ name = "You" }]
+dependencies = [
+  # Web & ASGI
+  "fastapi>=0.111.0,<1",
+  "uvicorn[standard]>=0.30.0,<1",
+
+  # Data & DB
+  "SQLAlchemy>=2.0.30,<3",
+  "sqlmodel>=0.0.19,<0.1",                  # OK to keep even if you mostly use SQLAlchemy
+  "psycopg[binary]>=3.1.12,<4",
+  "alembic>=1.13.2,<2",
+
+  # Validation & Settings
+  "pydantic>=2.7.0,<3",
+  "pydantic-settings>=2.2.1,<3",
+  "email-validator>=2.1.0",
+
+  # Auth (JWT + hashing + forms)
+  "python-jose[cryptography]>=3.3.0,<4",
+  "passlib[bcrypt]>=1.7.4,<2",
+  "bcrypt>=4.1.2,<5",
+  "python-multipart>=0.0.9",
+
+  # Google OAuth (no Redis sessions; purely stateless flow)
+  "Authlib>=1.3.0,<2",
+
+  # HTTP client (useful for callbacks/webhooks if needed)
+  "httpx>=0.27.0,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "black>=24.4",
+  "ruff>=0.4.2",
+  "pylint>=3.2.2",
+  "mypy>=1.10.0",
+  "types-requests",        # optional typing helpers
+]
+
+[project.scripts]
+# Handy local scripts
+format = "black ."
+lint = "ruff check ."
+lint:fix = "ruff check --fix ."
+pylint = "pylint app"
+test = "pytest -q"
+test:cov = "pytest --cov=app --cov-report=term-missing"
+serve = "uvicorn app.main:app --reload"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+# Ruff 0.4+ config (new layout)
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle
+  "F",   # pyflakes
+  "I",   # isort
+  "UP",  # pyupgrade
+  "B",   # bugbear
+  "C90", # mccabe (complexity)
+]
+ignore = [
+  "E203",  # Black compatibility for slicing
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+combine-as-imports = true
+
+[tool.pylint.MASTER]
+ignore = ["migrations", "tests", "scripts"]
+extension-pkg-allow-list = ["pydantic"]
+
+[tool.pylint."MESSAGES CONTROL"]
+disable = [
+  "R0903",  # too-few-public-methods (OK for Pydantic models/configs)
+  "C0114",  # missing-module-docstring (we'll add where it matters)
+  "C0116",  # missing-function-docstring (OK in small helpers)
+]
+
+[tool.pylint.BASIC]
+# Allow snake_case and Alembic versioned modules like 20250908_0002_*.py
+module-rgx = "(([a-z_][a-z0-9_]*)|([0-9]{8}_[0-9]{4}_[a-z0-9_]+))$"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+# Alembic reads this block; arrays MUST be closed properly.
+[tool.alembic]
+script_location = "migrations"
+version_locations = ["migrations/versions"]
+truncate_slug_length = 40
+# IMPORTANT: escape percent signs in TOML so Alembic can expand them later
+file_template = "%%(rev)s_%%(slug)s"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["migrations*", "tests*", "scripts*", "docs*"]

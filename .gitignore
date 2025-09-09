@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+.mypy_cache/
+.pytest_cache/
+.coverage
+dist/
+build/
+.migrations_history
