@@ -1,3 +1,5 @@
+# pylint: disable=W0718
+
 """Lightweight internationalization (i18n) support.
 
 This module provides a minimal, dependency-free i18n system suitable for

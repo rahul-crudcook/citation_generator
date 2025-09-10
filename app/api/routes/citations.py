@@ -1,23 +1,41 @@
 # app/api/routes/citations.py
-"""Citation endpoints: list types, validate details, and CRUD on citations.
+"""Citation endpoints: list source types, validate details (dry-run), and CRUD.
 
-M2 additions:
-- Alias discovery route: GET /meta/source-types (kept open for easy client bootstrapping).
-- Validate remains a *dry-run* (no DB writes), using the validation service.
+Scope
+-----
+M2:
+    - Type discovery endpoints.
+    - `/citations/validate` remains a *dry-run* (no DB writes), now powered by
+      ValidationService (M5 shape).
 
-M3 scope in this module:
-- Create/Edit/Delete flows for citations.
-- Validate + normalize before persist.
-- Optional filters (library_id, source_type) and pagination (page, size).
+M3:
+    - Create/Edit/Delete flows for citations.
+    - Validate + normalize before persist.
+
+M5:
+    - `/citations/validate` returns structured helper output:
+        {
+            "is_valid": bool,
+            "missing_required": [...],
+            "format_issues": [{"field": "...", "issue": "...", "message": "..."}],
+            "suggestions": [{"field": "...", "example": "...", "note": "..."}],
+            "normalized_facts": {...}
+        }
 """
+
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import (
+    get_current_user,
+    get_db,
+    get_validation_service,
+)
+from app.core.enums import SourceType
 from app.models.user import User
 from app.schemas.citation import (
     CitationCreateIn,
@@ -27,7 +45,7 @@ from app.schemas.citation import (
     ValidationResponse,
 )
 from app.services.citation_service import citation_service
-from app.services.citation_validation_service import citation_validation_service
+from app.services.validation_service import ValidationService
 
 # Primary router for /citations endpoints
 router = APIRouter(prefix="/citations", tags=["citations"])
@@ -67,29 +85,37 @@ def _entity_to_out(entity: Any) -> dict[str, Any]:
     }
 
 
+def _source_type_label(value: str) -> str:
+    """Generate a human-friendly label for a source type value.
+
+    Example:
+        "journal_article" -> "Journal Article"
+    """
+    return value.replace("_", " ").title()
+
+
+def _all_source_types() -> List[dict[str, str]]:
+    """Return all supported source types as value/label pairs."""
+    return [{"value": st.value, "label": _source_type_label(st.value)} for st in SourceType]
+
+
 # ----------------------------
 # Discovery (types)
 # ----------------------------
 @router.get("/types", response_model=list[dict[str, str]])
 def list_source_types() -> list[dict[str, str]]:
     """List supported source types (value + label) under the /citations namespace."""
-    return [
-        {"value": value, "label": label}
-        for value, label in citation_validation_service.supported_types()
-    ]
+    return _all_source_types()
 
 
 @META_ROUTER.get("/source-types", response_model=list[dict[str, str]])
 def list_source_types_alias() -> list[dict[str, str]]:
     """Alias: List supported source types at /meta/source-types for client bootstrapping."""
-    return [
-        {"value": value, "label": label}
-        for value, label in citation_validation_service.supported_types()
-    ]
+    return _all_source_types()
 
 
 # ----------------------------
-# Validation (dry-run)
+# Validation (dry-run, M5)
 # ----------------------------
 @router.post(
     "/validate",
@@ -100,13 +126,21 @@ def validate_citation(
     payload: CitationValidateIn,
     _db: Session = Depends(get_db),  # kept for parity/metrics, unused (no writes)
     _user: User = Depends(get_current_user),  # require auth to scope to user space
+    validation_service: ValidationService = Depends(get_validation_service),
 ) -> ValidationResponse:
     """Validate raw details against required & format rules for the given source type.
 
-    This is a *dry-run*: it does not persist anything to the database.
+    This endpoint performs a *dry-run*:
+        - It does not write to the database.
+        - It returns a structured payload with helper fields for UX.
+
+    Returns:
+        ValidationResponse: M5-shaped payload with `missing_required`,
+        `format_issues`, `suggestions`, and `normalized_facts`.
     """
     try:
-        return citation_validation_service.validate(payload.type, payload.details)
+        return validation_service.validate_with_helpers(
+            payload.type, payload.details)  # type: ignore[arg-type]
     except ValueError as exc:
         # Defensive: bad enum or schema-level error mapping to 400
         raise HTTPException(

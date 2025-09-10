@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from app.core.enums import SourceType
 
@@ -38,21 +38,18 @@ from app.core.enums import SourceType
 class ValidationService:
     """Service that validates, normalizes, and suggests fixes for citation details."""
 
-    # ----------------------------
-    # Required fields per source type (minimal viable sets)
-    # Adjust these if your schemas change field names.
-    # ----------------------------
+    # ---------------------------------------------------------------------
+    # Required fields per source type (aligned with current Pydantic schemas)
+    # ---------------------------------------------------------------------
+    # NOTE:
+    # - Keep this minimal and aligned with your *input* schemas in
+    #   app/schemas/citation.py. Do not require optional fields here.
     REQUIRED_FIELDS: Mapping[SourceType, Tuple[str, ...]] = {
         SourceType.book: ("authors", "title", "publisher", "year"),
-        SourceType.journal_article: (
-            "authors",
-            "article_title",
-            "journal_title",
-            "year",
-        ),
-        SourceType.magazine_newspaper: ("article_title", "periodical_title", "date"),
-        SourceType.encyclopedia_dictionary: ("article_title", "encyclopedia_title", "year"),
-        SourceType.website_webpage: ("work_title", "site_title", "url"),
+        SourceType.journal_article: ("authors", "title", "journal", "year"),
+        SourceType.magazine_newspaper: ("title", "publication"),
+        SourceType.encyclopedia: ("title",),
+        SourceType.website: ("title", "url"),
     }
 
     # ----------------------------
@@ -178,7 +175,8 @@ class ValidationService:
           - str: a single author string → best-effort split.
           - Anything else → empty list.
 
-        Note: This function does *not* raise; it normalizes leniently.
+        Note:
+            This function does *not* raise; it normalizes leniently.
         """
         if authors_val is None:
             return []
@@ -207,9 +205,9 @@ class ValidationService:
         """Split an author string into {first, last} using simple heuristics.
 
         Supported:
-          - 'Last, First Middle' → {'first': 'First Middle', 'last': 'Last'}
-          - 'First Middle Last'  → {'first': 'First Middle', 'last': 'Last'}
-          - 'SingleName'         → {'first': '', 'last': 'SingleName'}
+            - 'Last, First Middle' → {'first': 'First Middle', 'last': 'Last'}
+            - 'First Middle Last'  → {'first': 'First Middle', 'last': 'Last'}
+            - 'SingleName'         → {'first': '', 'last': 'SingleName'}
         """
         s = (s or "").strip()
         if not s:
@@ -255,6 +253,7 @@ class ValidationService:
     # Format checks → format_issues
     # ---------------------------------------------------------------------
     def _check_year(self, normalized: Mapping[str, Any]) -> List[Dict[str, str]]:
+        """Validate that 'year' is a 4-digit value when present."""
         issues: List[Dict[str, str]] = []
         year = normalized.get("year")
         if year is None:
@@ -268,6 +267,7 @@ class ValidationService:
         return issues
 
     def _check_url(self, normalized: Mapping[str, Any]) -> List[Dict[str, str]]:
+        """Validate that 'url' starts with http:// or https:// when present."""
         issues: List[Dict[str, str]] = []
         url = normalized.get("url")
         if url is None:
@@ -280,6 +280,7 @@ class ValidationService:
         return issues
 
     def _check_pages(self, normalized: Mapping[str, Any]) -> List[Dict[str, str]]:
+        """Validate page ranges/lists if provided (e.g., '12–18', '12, 25–27')."""
         issues: List[Dict[str, str]] = []
         pages = normalized.get("pages")
         if pages is None:

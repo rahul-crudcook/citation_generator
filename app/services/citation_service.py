@@ -1,23 +1,35 @@
 """Citation service: validate -> normalize -> persist (with partial update support).
 
-Responsibilities:
-- Validate incoming citation details against per-type rules (via validation service).
+Responsibilities
+----------------
+- Validate incoming citation details against per-type rules (via ValidationService).
 - Normalize facts before persisting to the database.
-- Support partial updates (PATCH) by denormalizing current facts to a raw shape,
-  deep-merging the incoming patch, re-validating, and re-normalizing.
+- Support partial updates (PATCH) by:
+    1) denormalizing current facts to a raw "validator" shape,
+    2) deep-merging the incoming patch,
+    3) re-validating, and
+    4) re-normalizing before persist.
 - Enforce row-level ownership for library moves and citation access.
+
+Notes
+-----
+This service is intentionally persistence-oriented. It delegates all validation
+and normalization to `ValidationService` to keep a single source of truth for
+rules and messages. Minor key-aliasing is handled here to adapt historical
+request payloads (e.g., "title" → "article_title") to validator expectations.
 """
+
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, MutableMapping
+from typing import Any, Dict, MutableMapping, Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.enums import SourceType
 from app.repos.citation_repository import CitationRepository
 from app.repos.library_repository import LibraryRepository
-from app.services.citation_validation_service import citation_validation_service
+from app.services.validation_service import ValidationService
 
 
 def _authors_norm_to_raw(authors: Any) -> list[str]:
@@ -52,14 +64,14 @@ def _authors_norm_to_raw(authors: Any) -> list[str]:
     return raw
 
 
-def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[str, Any]:
-    """Build raw details payload from stored normalized facts.
+def _normalized_to_raw(source_type: SourceType, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a *raw* details payload from stored normalized facts.
 
-    This is used during PATCH to:
+    Used during PATCH to:
         1) Convert the current (normalized) facts to a "raw" shape expected by
-           the validators.
-        2) Merge the user's patch into that raw shape.
-        3) Re-validate and normalize again before persisting.
+           the validator.
+        2) Let the user's patch merge into that raw shape.
+        3) Re-validate and re-normalize before persisting.
 
     Args:
         source_type: The citation source type.
@@ -80,10 +92,11 @@ def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[s
         }
 
     if source_type == SourceType.journal_article:
+        # Historical normalized keys: title / journal
         return {
-            "authors": _authors_norm_to_raw(facts.get("authors")),
             "title": facts.get("title") or "",
             "journal": facts.get("journal") or "",
+            "authors": _authors_norm_to_raw(facts.get("authors")),
             "year": facts.get("year") or "",
             "volume": facts.get("volume"),
             "issue": facts.get("issue"),
@@ -93,6 +106,7 @@ def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[s
         }
 
     if source_type == SourceType.magazine_newspaper:
+        # Historical normalized keys: title / publication
         return {
             "authors": _authors_norm_to_raw(facts.get("authors")),
             "title": facts.get("title") or "",
@@ -103,7 +117,6 @@ def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[s
             "url": facts.get("url"),
         }
 
-    # NOTE: If your enum is named `encyclopedia_dictionary`, adjust this case accordingly.
     if source_type == SourceType.encyclopedia:
         return {
             "title": facts.get("title") or "",
@@ -115,7 +128,6 @@ def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[s
             "url": facts.get("url"),
         }
 
-    # NOTE: If your enum is named `website_webpage`, adjust this case accordingly.
     if source_type == SourceType.website:
         return {
             "title": facts.get("title") or "",
@@ -129,7 +141,7 @@ def _normalized_to_raw(source_type: SourceType, facts: dict[str, Any]) -> dict[s
     return {}
 
 
-def _deep_merge(base: MutableMapping[str, Any], patch: dict[str, Any] | None) -> dict[str, Any]:
+def _deep_merge(base: MutableMapping[str, Any], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Deep-merge ``patch`` into ``base`` without modifying inputs.
 
     Rules:
@@ -143,7 +155,7 @@ def _deep_merge(base: MutableMapping[str, Any], patch: dict[str, Any] | None) ->
     Returns:
         A new dict representing the merged result.
     """
-    out: dict[str, Any] = deepcopy(base)
+    out: Dict[str, Any] = deepcopy(base)
     for key, value in (patch or {}).items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict):
             out[key] = _deep_merge(out[key], value)  # type: ignore[arg-type]
@@ -152,8 +164,60 @@ def _deep_merge(base: MutableMapping[str, Any], patch: dict[str, Any] | None) ->
     return out
 
 
+def _apply_aliases_for_validator(source_type: SourceType, raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapt historical request keys to the validator's expected field names.
+
+    This keeps the validator schemas stable while allowing older payload shapes.
+
+    Mappings:
+        - journal_article:
+            title -> article_title
+            journal -> journal_title
+        - magazine_newspaper:
+            title -> article_title
+            publication -> periodical_title
+        - website:
+            title -> work_title
+            # site_title might be missing in manual entry; leave as-is if absent.
+
+    Args:
+        source_type: Citation type.
+        raw: Raw details (request-like) dict.
+
+    Returns:
+        A shallow-copied dict with aliases applied.
+    """
+    out = dict(raw)
+
+    if source_type == SourceType.journal_article:
+        if "article_title" not in out and "title" in out:
+            out["article_title"] = out["title"]
+        if "journal_title" not in out and "journal" in out:
+            out["journal_title"] = out["journal"]
+
+    elif source_type == SourceType.magazine_newspaper:
+        if "article_title" not in out and "title" in out:
+            out["article_title"] = out["title"]
+        if "periodical_title" not in out and "publication" in out:
+            out["periodical_title"] = out["publication"]
+
+    elif source_type == SourceType.website:
+        if "work_title" not in out and "title" in out:
+            out["work_title"] = out["title"]
+
+    # book / encyclopedia currently align well with validator fields.
+    return out
+
+
 class CitationService:
-    """Coordinates validation and persistence for citations."""
+    """Coordinates validation and persistence for citations.
+
+    The service composes a `ValidationService` for all rule checks and
+    normalization. Inject a custom instance in tests if needed.
+    """
+
+    def __init__(self, validator: Optional[ValidationService] = None) -> None:
+        self._validator = validator or ValidationService()
 
     # ----------------------------
     # Create
@@ -164,15 +228,16 @@ class CitationService:
         *,
         user_id: int,
         source_type: SourceType,
-        details: dict[str, Any],
-        style: str | None,
-        library_id: int | None,
+        details: Dict[str, Any],
+        style: Optional[str],
+        library_id: Optional[int],
     ) -> Any:
         """Validate details, then persist normalized facts.
 
         Steps:
             - If `library_id` is provided, ensure the library is owned by the user.
-            - Validate raw `details` for the `source_type`.
+            - Apply key aliases to match validator expectations (backward-compat).
+            - Validate raw `details` for the `source_type` using `ValidationService`.
             - On success, persist normalized facts to the repository.
 
         Raises:
@@ -185,20 +250,19 @@ class CitationService:
         if library_id is not None:
             lib_repo = LibraryRepository(db)
             if lib_repo.get_owned(user_id, library_id) is None:
-                msg = "Library not found"
-                raise LookupError(msg)
+                raise LookupError("Library not found")
 
-        validation = citation_validation_service.validate(source_type, details)
-        if not validation.is_valid:
-            msg = "Validation failed"
-            raise ValueError(msg)
+        aliased = _apply_aliases_for_validator(source_type, dict(details))
+        result = self._validator.validate_with_helpers(source_type, aliased)
+        if not result.get("is_valid", False):
+            raise ValueError("Validation failed")
 
         repo = CitationRepository(db)
         entity = repo.create(
             user_id=user_id,
             library_id=library_id,
             source_type=source_type,
-            facts=validation.normalized_facts or {},
+            facts=result.get("normalized_facts") or {},
             style=(style.strip() if style else None),
         )
         return entity
@@ -211,10 +275,10 @@ class CitationService:
         db: Session,
         *,
         user_id: int,
-        library_id: int | None = None,
-        source_type: str | None = None,
-        page: int | None = None,
-        size: int | None = None,
+        library_id: Optional[int] = None,
+        source_type: Optional[str] = None,
+        page: Optional[int] = None,
+        size: Optional[int] = None,
     ) -> list[Any]:
         """List citations for a user (optional filters and pagination).
 
@@ -245,8 +309,7 @@ class CitationService:
         repo = CitationRepository(db)
         entity = repo.get_owned(user_id, citation_id)
         if not entity:
-            msg = "Citation not found"
-            raise LookupError(msg)
+            raise LookupError("Citation not found")
         return entity
 
     # ----------------------------
@@ -258,16 +321,16 @@ class CitationService:
         *,
         user_id: int,
         citation_id: int,
-        details: dict[str, Any] | None = None,
-        style: str | None = None,
-        library_id: int | None = None,
+        details: Optional[Dict[str, Any]] = None,
+        style: Optional[str] = None,
+        library_id: Optional[int] = None,
     ) -> Any:
         """Partially update a citation (details/style/library).
 
         Behavior:
             - Library move: if `library_id` is provided, ensure target library is owned.
             - Details patch: denormalize current facts to a raw shape, deep-merge the patch,
-              validate, then normalize and persist.
+              apply validator aliases, validate, then normalize and persist.
             - Style update: trimmed style string; empty -> None.
 
         Raises:
@@ -288,21 +351,20 @@ class CitationService:
         if library_id is not None:
             lib_repo = LibraryRepository(db)
             if lib_repo.get_owned(uid, library_id) is None:
-                msg = "Library not found"
-                raise LookupError(msg)
+                raise LookupError("Library not found")
             entity.library_id = library_id
 
-        # Details patch -> denormalize to raw -> merge -> validate -> normalize
+        # Details patch -> denormalize to raw -> merge -> alias -> validate -> normalize
         if details is not None:
             current_raw = _normalized_to_raw(entity.source_type, entity.facts or {})
             merged_raw = _deep_merge(current_raw, details)
+            aliased = _apply_aliases_for_validator(entity.source_type, merged_raw)
 
-            validation = citation_validation_service.validate(entity.source_type, merged_raw)
-            if not validation.is_valid:
-                msg = "Validation failed"
-                raise ValueError(msg)
+            result = self._validator.validate_with_helpers(entity.source_type, aliased)
+            if not result.get("is_valid", False):
+                raise ValueError("Validation failed")
 
-            entity.facts = validation.normalized_facts or {}
+            entity.facts = result.get("normalized_facts") or {}
 
         # Style update (only if provided)
         if style is not None:
@@ -320,11 +382,11 @@ class CitationService:
         repo = CitationRepository(db)
         entity = repo.get_owned(user_id, citation_id)
         if not entity:
-            msg = "Citation not found"
-            raise LookupError(msg)
+            raise LookupError("Citation not found")
         repo.delete(entity)
 
 
+# Module-level singleton for app usage (tests may construct their own instance).
 citation_service = CitationService()
 
 __all__ = ["citation_service", "CitationService"]

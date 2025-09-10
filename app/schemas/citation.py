@@ -1,11 +1,18 @@
-"""Pydantic schemas for citation validation I/O and per-type field catalogs (M2).
+"""Pydantic schemas for citation validation I/O and per-type field catalogs.
 
-Goals:
-- Canonical field names for each source type.
-- Strict input (extra fields forbidden) so clients see mistakes early.
+Goals
+-----
+- Canonical field names for each source type (strict inputs; extra fields forbidden).
 - Friendly input aliases so we can accept common variants without DB changes.
 - I/O wrappers for /citations endpoints.
+- M5: Structured validation helper output for `/citations/validate`.
+
+Notes
+-----
+Per-type "details" models define *client input* shape. The actual persisted
+facts are normalized (service layer) and returned via `CitationOut.details`.
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -16,9 +23,9 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from app.core.enums import SourceType
 
 
-# ---------------------------------------------------------------------
-# Per-type field catalogs (inputs from client)
-# ---------------------------------------------------------------------
+# =============================================================================
+# Per-type field catalogs (inputs from client)  —  M2
+# =============================================================================
 class BookDetails(BaseModel):
     """Input details for a book citation.
 
@@ -177,9 +184,9 @@ class WebsiteDetails(BaseModel):
     authors: List[str] = Field(default_factory=list, description="List of author names.")
 
 
-# ---------------------------------------------------------------------
-# API I/O wrappers
-# ---------------------------------------------------------------------
+# =============================================================================
+# API I/O wrappers  —  Validation (M5) + CRUD
+# =============================================================================
 class CitationValidateIn(BaseModel):
     """Payload for /citations/validate (dry-run normalization + checks)."""
 
@@ -187,25 +194,59 @@ class CitationValidateIn(BaseModel):
     details: Dict[str, Any]
 
 
-class ValidationIssue(BaseModel):
-    """Single validation issue item."""
+# ----- M5 helper items --------------------------------------------------------
+class FormatIssue(BaseModel):
+    """Single format issue discovered during validation.
+
+    Attributes:
+        field: The offending field path (e.g., "year", "authors[0]").
+        issue: A stable issue code (e.g., "not_4_digits", "invalid_url").
+        message: A human-friendly message (localization-ready).
+    """
 
     field: str
-    code: str
+    issue: str
     message: str
 
 
+# ---- Back-compat alias for pre-M5 imports -----------------------------------
+class ValidationIssue(FormatIssue):  # pylint: disable=too-few-public-methods
+    """Compatibility alias of FormatIssue for legacy code paths."""
+
+
+class Suggestion(BaseModel):
+    """Suggestion item to help users correct input.
+
+    Attributes:
+        field: Field path for which the suggestion applies.
+        example: An example value that would pass validation.
+        note: Optional explanatory note; can be localized text.
+    """
+
+    field: str
+    example: str
+    note: Optional[str] = None
+
+
 class ValidationResponse(BaseModel):
-    """Response for /citations/validate."""
+    """Response for /citations/validate (M5 shape).
+
+    Fields:
+        is_valid: Overall result (no missing required and no format issues).
+        missing_required: List of required fields that are absent/empty.
+        format_issues: Structured format issues with codes and messages.
+        suggestions: UX hints to help the user fix inputs.
+        normalized_facts: Best-effort normalized facts (even if invalid).
+    """
 
     is_valid: bool
-    issues: List[ValidationIssue] = Field(default_factory=list)
+    missing_required: List[str] = Field(default_factory=list)
+    format_issues: List[FormatIssue] = Field(default_factory=list)
+    suggestions: List[Suggestion] = Field(default_factory=list)
     normalized_facts: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------
-# CRUD I/O for /citations
-# ---------------------------------------------------------------------
+# ----- CRUD I/O for /citations ------------------------------------------------
 class CitationCreateIn(BaseModel):
     """Create a citation (validates + persists normalized facts)."""
 
@@ -252,8 +293,10 @@ __all__ = [
     "WebsiteDetails",
     # validation I/O
     "CitationValidateIn",
-    "ValidationIssue",
+    "FormatIssue",
+    "Suggestion",
     "ValidationResponse",
+    "ValidationIssue",  # legacy alias exported for back-compat
     # CRUD I/O
     "CitationCreateIn",
     "CitationUpdateIn",

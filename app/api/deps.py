@@ -10,6 +10,8 @@ This module exposes:
     * `get_http_client`: Lazy singleton async HTTP client used by fetchers/services.
     * `get_cache`: Lazy singleton cache (Redis if configured, else in-memory).
     * `get_ingest_service`: Orchestrator for DOI/ISBN/URL ingestion.
+- Validation (M5):
+    * `get_validation_service`: Stateless helper that produces UX-friendly validation payloads.
 
 Design notes
 ------------
@@ -35,6 +37,7 @@ from app.db.session import SessionLocal
 from app.models.user import User
 from app.services.ingest_service import IngestService
 from app.services.token_service import token_service
+from app.services.validation_service import ValidationService
 
 __all__ = [
     # DB
@@ -46,6 +49,8 @@ __all__ = [
     "get_http_client",
     "get_cache",
     "get_ingest_service",
+    # Validation / M5
+    "get_validation_service",
 ]
 
 # We allow missing Authorization headers so we can fall back to cookie tokens.
@@ -58,6 +63,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 _HTTP_CLIENT: Optional[AsyncHttpClientProtocol] = None
 _CACHE: Optional[AsyncCacheProtocol] = None
 _INGEST_SERVICE: Optional[IngestService] = None
+# Validation service is stateless and cheap; keep a singleton for symmetry.
+_VALIDATION_SERVICE: Optional[ValidationService] = None
 
 
 # ----------------------------
@@ -73,7 +80,7 @@ def get_db() -> Generator[Session, None, None]:
         - Closes the session in all cases.
 
     Yields:
-        `Session`: The SQLAlchemy session bound to the current request.
+        Session: The SQLAlchemy session bound to the current request.
     """
     db = SessionLocal()
     try:
@@ -299,3 +306,21 @@ def get_ingest_service(
     if _INGEST_SERVICE is None:
         _INGEST_SERVICE = IngestService(http=http, cache=cache, settings=settings)
     return _INGEST_SERVICE
+
+
+# ----------------------------
+# Validation dependency (M5)
+# ----------------------------
+def get_validation_service() -> ValidationService:
+    """Return a singleton `ValidationService` for UX-friendly validation (M5).
+
+    The service is stateless and safe to share. An optional i18n catalog
+    can be injected later by changing this provider to pass a message map.
+
+    Returns:
+        ValidationService: The shared validation service instance.
+    """
+    global _VALIDATION_SERVICE  # pylint: disable=global-statement
+    if _VALIDATION_SERVICE is None:
+        _VALIDATION_SERVICE = ValidationService()
+    return _VALIDATION_SERVICE
