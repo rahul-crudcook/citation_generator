@@ -1,9 +1,23 @@
 """Common API dependencies for FastAPI routes.
 
 This module exposes:
-- `get_db`: Provide a per-request SQLAlchemy session with commit/rollback semantics.
-- `get_current_user`: Strict dependency that returns the authenticated user or raises 401.
-- `get_current_user_optional`: Lenient dependency that returns the user or `None`.
+- Database/session:
+    * `get_db`: Per-request SQLAlchemy session with commit/rollback semantics.
+- Auth:
+    * `get_current_user`: Strict dependency that returns the authenticated user or raises 401.
+    * `get_current_user_optional`: Lenient dependency that returns the user or `None`.
+- Infra (M4):
+    * `get_http_client`: Lazy singleton async HTTP client used by fetchers/services.
+    * `get_cache`: Lazy singleton cache (Redis if configured, else in-memory).
+    * `get_ingest_service`: Orchestrator for DOI/ISBN/URL ingestion.
+
+Design notes
+------------
+- We keep infra singletons at module scope to avoid reconnecting per request.
+  They can be closed on process shutdown by the app's lifespan handler if desired.
+- Token resolution prefers Authorization header, then HttpOnly cookies when enabled.
+- ValueError vs RuntimeError boundaries are enforced in service/fetcher layers;
+  this module maps auth errors to HTTP 401/403 only.
 """
 
 from __future__ import annotations
@@ -15,19 +29,35 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.http import AsyncHttpClientProtocol, build_http_client
+from app.core.cache import AsyncCacheProtocol, build_cache
 from app.db.session import SessionLocal
 from app.models.user import User
+from app.services.ingest_service import IngestService
 from app.services.token_service import token_service
 
 __all__ = [
+    # DB
     "get_db",
+    # Auth
     "get_current_user",
     "get_current_user_optional",
+    # Infra / M4
+    "get_http_client",
+    "get_cache",
+    "get_ingest_service",
 ]
 
 # We allow missing Authorization headers so we can fall back to cookie tokens.
 # `auto_error=False` prevents FastAPI from raising 401 before we can check cookies.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+# ---------------------------------
+# Module-level singletons (lazy)
+# ---------------------------------
+_HTTP_CLIENT: Optional[AsyncHttpClientProtocol] = None
+_CACHE: Optional[AsyncCacheProtocol] = None
+_INGEST_SERVICE: Optional[IngestService] = None
 
 
 # ----------------------------
@@ -169,7 +199,7 @@ def _resolve_user_from_token(token: str, db: Session) -> User:
 
 
 # ----------------------------
-# Public dependencies
+# Public auth dependencies
 # ----------------------------
 def get_current_user(
     request: Request,
@@ -228,3 +258,44 @@ def get_current_user_optional(
     except HTTPException:
         # Swallow auth errors for the optional variant.
         return None
+
+
+# ----------------------------
+# Infra dependencies (M4)
+# ----------------------------
+def get_http_client() -> AsyncHttpClientProtocol:
+    """Return a lazy singleton async HTTP client for services/fetchers.
+
+    The client is created on first use and reused for subsequent requests.
+    """
+    global _HTTP_CLIENT  # pylint: disable=global-statement
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = build_http_client(user_agent=settings.USER_AGENT)
+    return _HTTP_CLIENT
+
+
+def get_cache() -> AsyncCacheProtocol:
+    """Return a lazy singleton cache (Redis if configured, else in-memory)."""
+    global _CACHE  # pylint: disable=global-statement
+    if _CACHE is None:
+        _CACHE = build_cache(settings.REDIS_URL)
+    return _CACHE
+
+
+def get_ingest_service(
+    http: AsyncHttpClientProtocol = Depends(get_http_client),
+    cache: AsyncCacheProtocol = Depends(get_cache),
+) -> IngestService:
+    """Return a lazy singleton `IngestService` orchestrator for M4.
+
+    Dependencies:
+        - `http`: Shared async HTTP client.
+        - `cache`: Shared cache instance.
+
+    Returns:
+        An `IngestService` instance configured with current settings.
+    """
+    global _INGEST_SERVICE  # pylint: disable=global-statement
+    if _INGEST_SERVICE is None:
+        _INGEST_SERVICE = IngestService(http=http, cache=cache, settings=settings)
+    return _INGEST_SERVICE

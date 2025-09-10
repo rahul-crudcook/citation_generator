@@ -1,50 +1,28 @@
-"""Pydantic schemas for Library resources.
-
-These schemas define the input/output contracts for the Library endpoints:
-- POST /libraries         -> LibraryCreate
-- GET  /libraries         -> list[LibraryOut]
-- PATCH /libraries/{id}   -> LibraryUpdate
-- DELETE /libraries/{id}  -> (no body)
-"""
+"""Pydantic schemas for Library CRUD (M3)."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-__all__ = ["LibraryCreate", "LibraryUpdate", "LibraryOut"]
-
-# NOTE:
-# We keep schemas explicit (no shared base class) for clarity and stability.
-# If you later add more fields (e.g., description), extend these models accordingly.
-
 
 class LibraryCreate(BaseModel):
-    """Input payload for creating a library/folder."""
-
-    name: str = Field(
-        ...,
-        min_length=1,
-        max_length=120,
-        description="Human-friendly name for the library/folder.",
-        examples=["My Research 2025", "Thesis Sources"],
-    )
+    """Payload to create a library."""
+    name: str = Field(min_length=1, max_length=200)
 
 
 class LibraryUpdate(BaseModel):
-    """Input payload for updating a library/folder (PATCH)."""
-
-    # Minimal constraints per your request (no description/examples).
-    name: str = Field(min_length=1, max_length=120)
+    """Payload to update a library (partial)."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
 
 
 class LibraryOut(BaseModel):
-    """Response payload representing a library/folder."""
+    """Library resource returned to clients."""
+    model_config = ConfigDict(from_attributes=True)
 
     id: int
     name: str
-    created_at: datetime
-
-    # Allow construction from ORM objects (SQLModel/SQLAlchemy rows).
-    model_config = ConfigDict(from_attributes=True)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None

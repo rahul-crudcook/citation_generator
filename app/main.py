@@ -5,12 +5,16 @@ This module exposes both:
 - `app` — a module-level instance used by ASGI servers (e.g., Uvicorn).
 
 Key behaviors:
-- CORS derived from settings (CSV/JSON list support expected in `settings.cors_origins`).
+- CORS derived from settings (CSV/JSON list support expected in
+  `settings.cors_origins`).
 - Credentials enabled to allow cookie-based JWT (HttpOnly cookies).
-- Routers: health, auth, citations, libraries (import-guarded).
+- Routers: health, auth, citations, libraries, ingest (import-guarded).
 - Minimal security headers and JSON error handlers.
 
-No Redis is used; JWT remains stateless (header and/or cookie).
+Notes:
+- For M4, we wire the `/ingest` router. Infra objects (HTTP client / cache)
+  are provided via dependency modules, not from this file.
+- No Redis is enforced here; JWT remains stateless (header and/or cookie).
 """
 
 from __future__ import annotations
@@ -64,6 +68,15 @@ except Exception as exc:  # pylint: disable=broad-except
 else:
     LIBRARY_ROUTES = library_routes  # type: ignore[assignment]
 
+# NEW: M4 ingest routes (optional — guarded import)
+try:
+    from app.api.routes import ingest as ingest_routes  # type: ignore
+except Exception as exc:  # pylint: disable=broad-except
+    LOGGER.info("Ingest routes not found (optional for M4): %s", exc)
+    INGEST_ROUTES = None  # type: ignore[assignment]
+else:
+    INGEST_ROUTES = ingest_routes  # type: ignore[assignment]
+
 
 # ----------------------------
 # Middleware and helpers
@@ -95,7 +108,9 @@ def _include_routers(application: FastAPI) -> None:
     """Include available route modules."""
     # health: router has no prefix; add it here
     if HEALTH_ROUTES is not None:
-        application.include_router(HEALTH_ROUTES.router, prefix="/health", tags=["health"])
+        application.include_router(
+            HEALTH_ROUTES.router, prefix="/health", tags=["health"]
+        )
     else:
         LOGGER.warning("Health routes not found or failed to import.")
 
@@ -118,6 +133,13 @@ def _include_routers(application: FastAPI) -> None:
         application.include_router(LIBRARY_ROUTES.router, tags=["libraries"])
     else:
         LOGGER.info("Library routes not found (optional).")
+
+    # ingest: optional; safe if missing until M4 is merged
+    if INGEST_ROUTES is not None:
+        # The ingest router defines prefix="/ingest" internally.
+        application.include_router(INGEST_ROUTES.router, tags=["ingest"])
+    else:
+        LOGGER.info("Ingest routes not found (optional for M4).")
 
 
 def _install_exception_handlers(application: FastAPI) -> None:
@@ -147,7 +169,11 @@ def _install_exception_handlers(application: FastAPI) -> None:
         )
         return JSONResponse(
             status_code=422,
-            content={"error": True, "message": "Validation error", "details": exc.errors()},
+            content={
+                "error": True,
+                "message": "Validation error",
+                "details": exc.errors(),
+            },
         )
 
 
@@ -163,7 +189,9 @@ def create_app() -> FastAPI:
     _include_routers(application)
 
     @application.middleware("http")
-    async def _security_headers_mw(request: Request, call_next):  # type: ignore[override]
+    async def _security_headers_mw(  # type: ignore[override]
+        request: Request, call_next
+    ):
         """Attach minimal security headers to every response."""
         response = await call_next(request)
         _add_security_headers(response)

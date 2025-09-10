@@ -4,19 +4,23 @@ This module exposes a single `settings` instance of `Settings`, which reads
 configuration from environment variables (and optionally a `.env` file).
 
 Key features:
+- App/env flags and CORS origins parsing (CSV or JSON list).
+- Database DSN.
 - JWT configuration (algorithm, expiries).
 - Cookie-based auth toggles (HttpOnly/Secure/SameSite, names, domain).
 - Google OAuth client settings (Authlib will use these).
-- CORS origins parsing (CSV or JSON list).
-- Environment mode flags (dev/stage/prod).
+- M4 (Auto-fetchers) settings: provider toggles, base URLs, HTTP timeouts,
+  default User-Agent, and optional Redis URL + cache TTL.
 
-No Redis is used; JWT is stateless by default.
+Notes:
+- No tight coupling to any framework; these settings are consumed by services.
+- JWT can be used via headers and/or cookies (when `use_cookie_auth` is True).
 """
 
 from __future__ import annotations
 
 import json
-from typing import List, Optional, Any
+from typing import Any, List, Optional
 
 from pydantic import AnyHttpUrl, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -68,7 +72,9 @@ class Settings(BaseSettings):
     # OAuth (Google) – used by Authlib
     # ----------------------------
     google_client_id: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_ID")
-    google_client_secret: Optional[str] = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
+    google_client_secret: Optional[str] = Field(
+        default=None, alias="GOOGLE_CLIENT_SECRET"
+    )
     # Public callback/redirect URI registered in Google Console
     google_redirect_uri: Optional[AnyHttpUrl] = Field(
         default=None, alias="GOOGLE_REDIRECT_URI"
@@ -86,6 +92,41 @@ class Settings(BaseSettings):
     #   CORS_ORIGINS='["https://app.example.com", "https://admin.example.com"]'
     cors_origins_env: Optional[str] = Field(default=None, alias="CORS_ORIGINS")
 
+    # ----------------------------
+    # M4 — Auto-fetchers (HTTP, providers, cache)
+    # ----------------------------
+    # Provider toggles
+    ENABLE_CROSSREF: bool = Field(default=True, alias="ENABLE_CROSSREF")
+    ENABLE_OPENLIBRARY: bool = Field(default=True, alias="ENABLE_OPENLIBRARY")
+    ENABLE_URL_SCRAPE: bool = Field(default=True, alias="ENABLE_URL_SCRAPE")
+    # Future optional providers (stubs)
+    ENABLE_ARXIV: bool = Field(default=False, alias="ENABLE_ARXIV")
+    ENABLE_PUBMED: bool = Field(default=False, alias="ENABLE_PUBMED")
+
+    # Provider base URLs
+    CROSSREF_BASE_URL: str = Field(
+        default="https://api.crossref.org/works", alias="CROSSREF_BASE_URL"
+    )
+    OPENLIBRARY_BASE_URL: str = Field(
+        default="https://openlibrary.org", alias="OPENLIBRARY_BASE_URL"
+    )
+
+    # HTTP settings for fetchers
+    FETCH_TIMEOUT_SECONDS: float = Field(default=10.0, alias="FETCH_TIMEOUT_SECONDS")
+    USER_AGENT: str = Field(
+        default="citation-generator/1.0 (+https://example.com)",
+        alias="USER_AGENT",
+    )
+
+    # Cache (Redis optional). If REDIS_URL is empty, fall back to in-memory.
+    REDIS_URL: Optional[str] = Field(default=None, alias="REDIS_URL")
+    INGEST_CACHE_TTL_SECONDS: int = Field(
+        default=60 * 60 * 24, alias="INGEST_CACHE_TTL_SECONDS"
+    )  # 24h
+
+    # ----------------------------
+    # Pydantic settings behavior
+    # ----------------------------
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
