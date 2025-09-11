@@ -12,6 +12,8 @@ This module exposes:
     * `get_ingest_service`: Orchestrator for DOI/ISBN/URL ingestion.
 - Validation (M5):
     * `get_validation_service`: Stateless helper that produces UX-friendly validation payloads.
+- Formatting (M6):
+    * `get_format_service`: Stateless, deterministic citation formatter with style adapters.
 
 Design notes
 ------------
@@ -38,6 +40,7 @@ from app.models.user import User
 from app.services.ingest_service import IngestService
 from app.services.token_service import token_service
 from app.services.validation_service import ValidationService
+from app.services.format_service import FormatService
 
 __all__ = [
     # DB
@@ -51,6 +54,8 @@ __all__ = [
     "get_ingest_service",
     # Validation / M5
     "get_validation_service",
+    # Formatting / M6
+    "get_format_service",
 ]
 
 # We allow missing Authorization headers so we can fall back to cookie tokens.
@@ -63,8 +68,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 _HTTP_CLIENT: Optional[AsyncHttpClientProtocol] = None
 _CACHE: Optional[AsyncCacheProtocol] = None
 _INGEST_SERVICE: Optional[IngestService] = None
-# Validation service is stateless and cheap; keep a singleton for symmetry.
+# Validation/format services are stateless and cheap; singletons for symmetry.
 _VALIDATION_SERVICE: Optional[ValidationService] = None
+_FORMAT_SERVICE: Optional[FormatService] = None
 
 
 # ----------------------------
@@ -324,3 +330,20 @@ def get_validation_service() -> ValidationService:
     if _VALIDATION_SERVICE is None:
         _VALIDATION_SERVICE = ValidationService()
     return _VALIDATION_SERVICE
+
+
+# ----------------------------
+# Formatting dependency (M6)
+# ----------------------------
+def get_format_service() -> FormatService:
+    """Return a singleton `FormatService` (formatter engine; M6).
+
+    The formatter is stateless and deterministic; safe to reuse globally.
+
+    Returns:
+        FormatService: The shared formatter service instance.
+    """
+    global _FORMAT_SERVICE  # pylint: disable=global-statement
+    if _FORMAT_SERVICE is None:
+        _FORMAT_SERVICE = FormatService()
+    return _FORMAT_SERVICE

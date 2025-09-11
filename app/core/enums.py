@@ -1,8 +1,8 @@
 """Shared enums used across the app (models, schemas, services).
 
 These enums provide canonical string values for source types, fetch sources,
-and validation issue codes. They are used consistently across schemas,
-database models, and services to avoid magic strings.
+validation issue codes, and formatting styles. They are used consistently
+across schemas, database models, and services to avoid magic strings.
 """
 
 from __future__ import annotations
@@ -65,4 +65,19 @@ class ValidationIssueCode(StrEnum):
     empty_string = "empty_string"
 
 
-__all__ = ["SourceType", "FetchSource", "ValidationIssueCode"]
+class Style(StrEnum):
+    """Supported citation styles for the formatter engine (M6).
+
+    Member names are lowercase and match their string values to ensure
+    stable contracts in request/response payloads and internal comparisons.
+    """
+
+    # pylint: disable=invalid-name
+    apa = "apa"
+    mla = "mla"
+    chicago = "chicago"
+    turabian = "turabian"
+    harvard = "harvard"
+
+
+__all__ = ["SourceType", "FetchSource", "ValidationIssueCode", "Style"]

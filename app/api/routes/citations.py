@@ -13,28 +13,21 @@ M3:
     - Validate + normalize before persist.
 
 M5:
-    - `/citations/validate` returns structured helper output:
-        {
-            "is_valid": bool,
-            "missing_required": [...],
-            "format_issues": [{"field": "...", "issue": "...", "message": "..."}],
-            "suggestions": [{"field": "...", "example": "...", "note": "..."}],
-            "normalized_facts": {...}
-        }
+    - `/citations/validate` returns structured helper output.
+
+M6:
+    - Create/Patch accept an optional *format-now* toggle (body extra or query `?format=true`)
+      to compute and store `formatted_text` immediately.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import (
-    get_current_user,
-    get_db,
-    get_validation_service,
-)
+from app.api.deps import get_current_user, get_db, get_validation_service
 from app.core.enums import SourceType
 from app.models.user import User
 from app.schemas.citation import (
@@ -54,8 +47,8 @@ router = APIRouter(prefix="/citations", tags=["citations"])
 META_ROUTER = APIRouter(prefix="/meta", tags=["meta"])
 
 
-def _entity_to_out(entity: Any) -> dict[str, Any]:
-    """Map a SQLAlchemy/ORM Citation entity to the `CitationOut` shape.
+def _entity_to_out(entity: Any) -> Dict[str, Any]:
+    """Map an ORM Citation entity to the `CitationOut` shape.
 
     This function is defensive against minor naming differences that can occur
     during refactors (e.g., `type` vs `source_type`, `facts` vs `facts_jsonb`).
@@ -99,6 +92,53 @@ def _all_source_types() -> List[dict[str, str]]:
     return [{"value": st.value, "label": _source_type_label(st.value)} for st in SourceType]
 
 
+def _extract_format_now(
+    payload: object,
+    format_param: Optional[bool],
+    format_now_param: Optional[bool],
+) -> bool:
+    """Determine whether caller requested immediate formatting (M6).
+
+    Resolution priority:
+        1) Explicit query flags: `?format=true|false` or `?format_now=true|false`
+           (the latter wins if both are provided).
+        2) Extra body field `format` or `format_now` (ignored by Pydantic model but
+           available via `model_extra` in Pydantic v2). Either truthy enables formatting.
+
+    Args:
+        payload: The Pydantic model instance received in the body.
+        format_param: Parsed query parameter `format`.
+        format_now_param: Parsed query parameter `format_now`.
+
+    Returns:
+        True if formatting should run immediately.
+    """
+    # Query wins over body.
+    if format_now_param is not None:
+        return bool(format_now_param)
+    if format_param is not None:
+        return bool(format_param)
+
+    # Try to read extra body fields (Pydantic v2 keeps them in `model_extra`).
+    extra = getattr(payload, "model_extra", None)
+    if isinstance(extra, dict):
+        if "format_now" in extra:
+            return bool(extra.get("format_now"))
+        if "format" in extra:
+            return bool(extra.get("format"))
+
+    # Best-effort fallback for environments where extras might be attached to __dict__
+    # (defensive; harmless if absent).
+    dunder = getattr(payload, "__dict__", None)
+    if isinstance(dunder, dict):
+        if "format_now" in dunder:
+            return bool(dunder.get("format_now"))
+        if "format" in dunder:
+            return bool(dunder.get("format"))
+
+    return False
+
+
 # ----------------------------
 # Discovery (types)
 # ----------------------------
@@ -139,8 +179,8 @@ def validate_citation(
         `format_issues`, `suggestions`, and `normalized_facts`.
     """
     try:
-        return validation_service.validate_with_helpers(
-            payload.type, payload.details)  # type: ignore[arg-type]
+        # payload.type is a SourceType (enum); the service accepts the enum.
+        return validation_service.validate_with_helpers(payload.type, payload.details)
     except ValueError as exc:
         # Defensive: bad enum or schema-level error mapping to 400
         raise HTTPException(
@@ -189,9 +229,18 @@ def create_citation(
     payload: CitationCreateIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    # M6: allow formatting via query flag as well
+    format_q: Optional[bool] = Query(default=None, alias="format"),
+    format_now_q: Optional[bool] = Query(default=None, alias="format_now"),
 ) -> CitationOut:
-    """Validate and persist a citation; stores normalized facts."""
+    """Validate and persist a citation; stores normalized facts.
+
+    If `format=true` (or `format_now=true`) is provided as a query parameter,
+    or an extra body field `format` / `format_now` is present, the service will
+    also compute and persist `formatted_text` immediately (M6).
+    """
     try:
+        format_now = _extract_format_now(payload, format_q, format_now_q)
         entity = citation_service.create(
             db,
             user_id=user.id,
@@ -199,6 +248,7 @@ def create_citation(
             details=payload.details,
             style=payload.style,
             library_id=payload.library_id,
+            format_now=format_now,
         )
         return _entity_to_out(entity)
     except LookupError as exc:
@@ -221,9 +271,7 @@ def get_citation(
 ) -> CitationOut:
     """Get a single citation owned by the current user."""
     try:
-        entity = citation_service.get_owned(
-            db, user_id=user.id, citation_id=citation_id
-        )
+        entity = citation_service.get_owned(db, user_id=user.id, citation_id=citation_id)
         return _entity_to_out(entity)
     except LookupError as exc:
         raise HTTPException(
@@ -237,6 +285,9 @@ def update_citation(
     payload: CitationUpdateIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    # M6: allow formatting via query flag as well
+    format_q: Optional[bool] = Query(default=None, alias="format"),
+    format_now_q: Optional[bool] = Query(default=None, alias="format_now"),
 ) -> CitationOut:
     """Update details/style/library for a citation.
 
@@ -245,9 +296,11 @@ def update_citation(
         - re-validates,
         - normalizes,
         - persists,
-        - and returns the updated entity.
+        - and (optionally) formats `formatted_text` when requested via the
+          *format-now* toggle.
     """
     try:
+        format_now = _extract_format_now(payload, format_q, format_now_q)
         entity = citation_service.update(
             db,
             user_id=user.id,
@@ -255,6 +308,7 @@ def update_citation(
             details=payload.details,
             style=payload.style,
             library_id=payload.library_id,
+            format_now=format_now,
         )
         return _entity_to_out(entity)
     except LookupError as exc:

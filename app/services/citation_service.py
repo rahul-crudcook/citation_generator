@@ -1,4 +1,4 @@
-"""Citation service: validate -> normalize -> persist (with partial update support).
+"""Citation service: validate → normalize → persist (with partial update support).
 
 Responsibilities
 ----------------
@@ -10,6 +10,7 @@ Responsibilities
     3) re-validating, and
     4) re-normalizing before persist.
 - Enforce row-level ownership for library moves and citation access.
+- (M6) When requested, format and store `formatted_text` using the FormatService.
 
 Notes
 -----
@@ -30,6 +31,7 @@ from app.core.enums import SourceType
 from app.repos.citation_repository import CitationRepository
 from app.repos.library_repository import LibraryRepository
 from app.services.validation_service import ValidationService
+from app.services.format_service import FormatService
 
 
 def _authors_norm_to_raw(authors: Any) -> list[str]:
@@ -213,11 +215,21 @@ class CitationService:
     """Coordinates validation and persistence for citations.
 
     The service composes a `ValidationService` for all rule checks and
-    normalization. Inject a custom instance in tests if needed.
+    normalization, and optionally a `FormatService` (M6) to produce and store
+    deterministic, style-specific `formatted_text`.
+
+    Args:
+        validator: Optional custom validator instance (useful for tests).
+        formatter: Optional custom formatter (useful for tests or advanced configs).
     """
 
-    def __init__(self, validator: Optional[ValidationService] = None) -> None:
+    def __init__(
+        self,
+        validator: Optional[ValidationService] = None,
+        formatter: Optional[FormatService] = None,
+    ) -> None:
         self._validator = validator or ValidationService()
+        self._formatter = formatter or FormatService()
 
     # ----------------------------
     # Create
@@ -231,14 +243,17 @@ class CitationService:
         details: Dict[str, Any],
         style: Optional[str],
         library_id: Optional[int],
+        format_now: bool = False,
     ) -> Any:
-        """Validate details, then persist normalized facts.
+        """Validate details, then persist normalized facts (and optionally format).
 
         Steps:
             - If `library_id` is provided, ensure the library is owned by the user.
             - Apply key aliases to match validator expectations (backward-compat).
             - Validate raw `details` for the `source_type` using `ValidationService`.
-            - On success, persist normalized facts to the repository.
+            - Persist normalized facts.
+            - (M6) If `format_now` is True and `style` is provided, compute and store
+              `formatted_text` via the `FormatService`.
 
         Raises:
             LookupError: If the referenced library does not exist or is not owned by the user.
@@ -257,14 +272,27 @@ class CitationService:
         if not result.get("is_valid", False):
             raise ValueError("Validation failed")
 
+        normalized_facts: Dict[str, Any] = result.get("normalized_facts") or {}
+
         repo = CitationRepository(db)
         entity = repo.create(
             user_id=user_id,
             library_id=library_id,
             source_type=source_type,
-            facts=result.get("normalized_facts") or {},
+            facts=normalized_facts,
             style=(style.strip() if style else None),
         )
+
+        # Optionally format and persist the preview text.
+        if format_now and style:
+            # Compute deterministically; swallow no exceptions here—let them bubble.
+            formatted = self._formatter.format_preview(
+                style=style, source_type=source_type, facts=normalized_facts
+            )
+            # Update ORM entity and flush for read-your-writes semantics.
+            setattr(entity, "formatted_text", formatted)
+            db.flush()
+
         return entity
 
     # ----------------------------
@@ -324,14 +352,17 @@ class CitationService:
         details: Optional[Dict[str, Any]] = None,
         style: Optional[str] = None,
         library_id: Optional[int] = None,
+        format_now: bool = False,
     ) -> Any:
-        """Partially update a citation (details/style/library).
+        """Partially update a citation (details/style/library) and optionally reformat.
 
         Behavior:
             - Library move: if `library_id` is provided, ensure target library is owned.
             - Details patch: denormalize current facts to a raw shape, deep-merge the patch,
               apply validator aliases, validate, then normalize and persist.
             - Style update: trimmed style string; empty -> None.
+            - (M6) If `format_now` is True and a style is present (new or existing),
+              update `formatted_text` using the latest facts/style.
 
         Raises:
             LookupError: If the citation or target library is not found or not owned by user.
@@ -354,6 +385,8 @@ class CitationService:
                 raise LookupError("Library not found")
             entity.library_id = library_id
 
+        facts_changed = False
+
         # Details patch -> denormalize to raw -> merge -> alias -> validate -> normalize
         if details is not None:
             current_raw = _normalized_to_raw(entity.source_type, entity.facts or {})
@@ -365,10 +398,24 @@ class CitationService:
                 raise ValueError("Validation failed")
 
             entity.facts = result.get("normalized_facts") or {}
+            facts_changed = True
 
         # Style update (only if provided)
+        style_changed = False
         if style is not None:
             entity.style = style.strip() or None
+            style_changed = True
+
+        # Re-format if requested and possible (style present either newly or already stored).
+        if format_now and (style_changed or facts_changed or entity.formatted_text is None):
+            chosen_style = entity.style
+            if chosen_style:
+                formatted = self._formatter.format_preview(
+                    style=chosen_style,
+                    source_type=entity.source_type,
+                    facts=entity.facts or {},
+                )
+                setattr(entity, "formatted_text", formatted)
 
         # Persist changes; flush for in-transaction read-your-writes semantics.
         db.flush()

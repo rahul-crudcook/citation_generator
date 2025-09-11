@@ -1,3 +1,4 @@
+# citation_generator/app/main.py
 """FastAPI application entrypoint with CORS, routers, and minimal hardening.
 
 This module exposes both:
@@ -8,12 +9,13 @@ Key behaviors:
 - CORS derived from settings (CSV/JSON list support expected in
   `settings.cors_origins`).
 - Credentials enabled to allow cookie-based JWT (HttpOnly cookies).
-- Routers: health, auth, citations, libraries, ingest (import-guarded).
+- Routers: health, auth, citations, libraries, ingest, and format (guarded).
 - Minimal security headers and JSON error handlers.
 
 Notes:
 - For M4, we wire the `/ingest` router. Infra objects (HTTP client / cache)
   are provided via dependency modules, not from this file.
+- For M6, we wire the `/format` router for previewing citation strings.
 - No Redis is enforced here; JWT remains stateless (header and/or cookie).
 """
 
@@ -37,6 +39,7 @@ LOGGER = logging.getLogger(__name__)
 # Guarded router imports (avoid hard failures in early milestones)
 # ----------------------------
 try:
+    # Health routes (mounted under /health here)
     from app.api.routes import health as health_routes  # type: ignore
 except Exception as exc:  # pylint: disable=broad-except
     LOGGER.exception("Failed to import health routes: %s", exc)
@@ -45,6 +48,7 @@ else:
     HEALTH_ROUTES = health_routes  # type: ignore[assignment]
 
 try:
+    # Auth routes (declare their own prefix="/auth")
     from app.api.routes import auth as auth_routes  # type: ignore
 except Exception as exc:  # pylint: disable=broad-except
     LOGGER.exception("Failed to import auth routes: %s", exc)
@@ -53,6 +57,7 @@ else:
     AUTH_ROUTES = auth_routes  # type: ignore[assignment]
 
 try:
+    # Citations routes (declare their own prefix="/citations")
     from app.api.routes import citations as citation_routes  # type: ignore
 except Exception as exc:  # pylint: disable=broad-except
     LOGGER.exception("Failed to import citation routes: %s", exc)
@@ -61,6 +66,7 @@ else:
     CITATION_ROUTES = citation_routes  # type: ignore[assignment]
 
 try:
+    # Libraries routes (optional)
     from app.api.routes import libraries as library_routes  # type: ignore
 except Exception as exc:  # pylint: disable=broad-except
     LOGGER.info("Library routes not found (optional): %s", exc)
@@ -68,8 +74,8 @@ except Exception as exc:  # pylint: disable=broad-except
 else:
     LIBRARY_ROUTES = library_routes  # type: ignore[assignment]
 
-# NEW: M4 ingest routes (optional — guarded import)
 try:
+    # Ingest routes (optional; M4)
     from app.api.routes import ingest as ingest_routes  # type: ignore
 except Exception as exc:  # pylint: disable=broad-except
     LOGGER.info("Ingest routes not found (optional for M4): %s", exc)
@@ -77,14 +83,34 @@ except Exception as exc:  # pylint: disable=broad-except
 else:
     INGEST_ROUTES = ingest_routes  # type: ignore[assignment]
 
+try:
+    # NEW (M6): Formatting routes (prefix="/format")
+    from app.api.routes import format as format_routes  # type: ignore
+except Exception as exc:  # pylint: disable=broad-except
+    LOGGER.info("Format routes not found (optional for M6): %s", exc)
+    FORMAT_ROUTES = None  # type: ignore[assignment]
+else:
+    FORMAT_ROUTES = format_routes  # type: ignore[assignment]
+
 
 # ----------------------------
 # Middleware and helpers
 # ----------------------------
 def _add_cors(application: FastAPI) -> None:
-    """Attach CORS middleware based on settings."""
+    """Attach CORS middleware based on settings.
+
+    We support two patterns:
+    - `["*"]` (or a single "*" string) to allow all origins (useful for local dev).
+    - A concrete list of origins.
+    """
     origins: Iterable[str] = settings.cors_origins or []
-    allow_all = len(origins) == 1 and next(iter(origins), "") == "*"
+    # If configured as ["*"] or just "*"
+    allow_all = False
+    try:
+        first = next(iter(origins))
+        allow_all = len(list(origins)) == 1 and first == "*"
+    except StopIteration:
+        allow_all = False
 
     application.add_middleware(
         CORSMiddleware,
@@ -105,12 +131,10 @@ def _add_security_headers(response: Response) -> None:
 
 
 def _include_routers(application: FastAPI) -> None:
-    """Include available route modules."""
+    """Include available route modules in the application."""
     # health: router has no prefix; add it here
     if HEALTH_ROUTES is not None:
-        application.include_router(
-            HEALTH_ROUTES.router, prefix="/health", tags=["health"]
-        )
+        application.include_router(HEALTH_ROUTES.router, prefix="/health", tags=["health"])
     else:
         LOGGER.warning("Health routes not found or failed to import.")
 
@@ -140,6 +164,12 @@ def _include_routers(application: FastAPI) -> None:
         application.include_router(INGEST_ROUTES.router, tags=["ingest"])
     else:
         LOGGER.info("Ingest routes not found (optional for M4).")
+
+    # format: optional; M6 router (prefix="/format" declared in the module)
+    if FORMAT_ROUTES is not None:
+        application.include_router(FORMAT_ROUTES.router, tags=["format"])
+    else:
+        LOGGER.info("Format routes not found (optional for M6).")
 
 
 def _install_exception_handlers(application: FastAPI) -> None:
@@ -205,5 +235,5 @@ def create_app() -> FastAPI:
     return application
 
 
-# Module-level app instance for `uvicorn main:app --reload`
+# Module-level app instance for `uvicorn app.main:app --reload`
 app: FastAPI = create_app()
