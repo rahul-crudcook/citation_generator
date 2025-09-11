@@ -9,20 +9,20 @@ Key behaviors:
 - CORS derived from settings (CSV/JSON list support expected in
   `settings.cors_origins`).
 - Credentials enabled to allow cookie-based JWT (HttpOnly cookies).
-- Routers: health, auth, citations, libraries, ingest, and format (guarded).
+- Routers: health, auth, citations, libraries, ingest, format, and exports.
 - Minimal security headers and JSON error handlers.
 
 Notes:
 - For M4, we wire the `/ingest` router. Infra objects (HTTP client / cache)
   are provided via dependency modules, not from this file.
 - For M6, we wire the `/format` router for previewing citation strings.
+- For M7, we add the `exports` router (single + bulk export endpoints).
 - No Redis is enforced here; JWT remains stateless (header and/or cookie).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Iterable
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -92,6 +92,15 @@ except Exception as exc:  # pylint: disable=broad-except
 else:
     FORMAT_ROUTES = format_routes  # type: ignore[assignment]
 
+try:
+    # NEW (M7): Exports routes (prefixes inside module)
+    from app.api.routes import exports as exports_routes  # type: ignore
+except Exception as exc:  # pylint: disable=broad-except
+    LOGGER.info("Exports routes not found (optional for M7): %s", exc)
+    EXPORTS_ROUTES = None  # type: ignore[assignment]
+else:
+    EXPORTS_ROUTES = exports_routes  # type: ignore[assignment]
+
 
 # ----------------------------
 # Middleware and helpers
@@ -103,18 +112,12 @@ def _add_cors(application: FastAPI) -> None:
     - `["*"]` (or a single "*" string) to allow all origins (useful for local dev).
     - A concrete list of origins.
     """
-    origins: Iterable[str] = settings.cors_origins or []
-    # If configured as ["*"] or just "*"
-    allow_all = False
-    try:
-        first = next(iter(origins))
-        allow_all = len(list(origins)) == 1 and first == "*"
-    except StopIteration:
-        allow_all = False
+    origins_list = list(settings.cors_origins or [])
+    allow_all = len(origins_list) == 1 and origins_list[0] == "*"
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if allow_all else list(origins),
+        allow_origins=["*"] if allow_all else origins_list,
         allow_credentials=True,  # enable cookie-based auth
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
@@ -170,6 +173,12 @@ def _include_routers(application: FastAPI) -> None:
         application.include_router(FORMAT_ROUTES.router, tags=["format"])
     else:
         LOGGER.info("Format routes not found (optional for M6).")
+
+    # exports: optional; M7 router (declares its own paths)
+    if EXPORTS_ROUTES is not None:
+        application.include_router(EXPORTS_ROUTES.router, tags=["exports"])
+    else:
+        LOGGER.info("Exports routes not found (optional for M7).")
 
 
 def _install_exception_handlers(application: FastAPI) -> None:

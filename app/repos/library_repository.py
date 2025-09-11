@@ -1,3 +1,4 @@
+# app/repos/library_repository.py
 """Repository layer for `Library` entities.
 
 This module provides a thin data-access layer around SQLAlchemy for the
@@ -55,6 +56,21 @@ class LibraryRepository(BaseRepository[Library]):
             and_(Library.id == library_id, Library.user_id == user_id)
         )
         return self.db.scalars(stmt).first()
+
+    def get_by_id_owned(self, *, user_id: int, library_id: int) -> Library | None:
+        """Alias for :meth:`get_owned` to match service expectations.
+
+        ExportService and some routes call `get_by_id_owned(...)`. Keep both
+        names to preserve backwards compatibility across milestones.
+
+        Args:
+            user_id: Owner user ID.
+            library_id: Target library ID.
+
+        Returns:
+            The `Library` entity if owned, otherwise `None`.
+        """
+        return self.get_owned(user_id=user_id, library_id=library_id)
 
     def list_for_user(self, user_id: int) -> list[Library]:
         """List all libraries for a user, newest first.

@@ -1,11 +1,11 @@
 # app/api/routes/citations.py
-"""Citation endpoints: list source types, validate details (dry-run), and CRUD.
+"""Citation endpoints: discovery, validation (dry-run), CRUD, and export.
 
 Scope
 -----
 M2:
     - Type discovery endpoints.
-    - `/citations/validate` remains a *dry-run* (no DB writes), now powered by
+    - `/citations/validate` remains a *dry-run* (no DB writes), powered by
       ValidationService (M5 shape).
 
 M3:
@@ -16,18 +16,24 @@ M5:
     - `/citations/validate` returns structured helper output.
 
 M6:
-    - Create/Patch accept an optional *format-now* toggle (body extra or query `?format=true`)
-      to compute and store `formatted_text` immediately.
+    - Create/Patch accept an optional *format-now* toggle (body extra or query
+      `?format=true`) to compute and store `formatted_text` immediately.
+
+M7:
+    - `GET /citations/{citation_id}/export?type=docx|txt|bib|json`
+      Streams (now returns as bytes `Response`) a single citation export
+      as an attachment. Ownership enforced.
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db, get_validation_service
+from app.api.deps import get_current_user, get_db, get_validation_service  # type: ignore
 from app.core.enums import SourceType
 from app.models.user import User
 from app.schemas.citation import (
@@ -38,6 +44,8 @@ from app.schemas.citation import (
     ValidationResponse,
 )
 from app.services.citation_service import citation_service
+from app.services.export_service import ExportService
+from app.services.format_service import FormatService
 from app.services.validation_service import ValidationService
 
 # Primary router for /citations endpoints
@@ -45,6 +53,25 @@ router = APIRouter(prefix="/citations", tags=["citations"])
 
 # Separate router for global meta endpoints (alias for source-type discovery)
 META_ROUTER = APIRouter(prefix="/meta", tags=["meta"])
+
+
+class ExportTypeEnum(str, Enum):
+    """Supported export types for single-citation export (M7)."""
+
+    TXT = "txt"
+    DOCX = "docx"
+    BIB = "bib"
+    JSON = "json"
+
+
+def _build_export_service(db: Session) -> ExportService:
+    """Create an ExportService instance with its FormatService dependency.
+
+    Keeping service construction in a small helper isolates wiring and keeps
+    the route handler focused solely on IO concerns (HTTP/streaming).
+    """
+    fmt = FormatService()
+    return ExportService(db=db, format_service=fmt)
 
 
 def _entity_to_out(entity: Any) -> Dict[str, Any]:
@@ -127,8 +154,7 @@ def _extract_format_now(
         if "format" in extra:
             return bool(extra.get("format"))
 
-    # Best-effort fallback for environments where extras might be attached to __dict__
-    # (defensive; harmless if absent).
+    # Best-effort fallback for environments where extras might be attached to __dict__.
     dunder = getattr(payload, "__dict__", None)
     if isinstance(dunder, dict):
         if "format_now" in dunder:
@@ -173,23 +199,17 @@ def validate_citation(
     This endpoint performs a *dry-run*:
         - It does not write to the database.
         - It returns a structured payload with helper fields for UX.
-
-    Returns:
-        ValidationResponse: M5-shaped payload with `missing_required`,
-        `format_issues`, `suggestions`, and `normalized_facts`.
     """
     try:
-        # payload.type is a SourceType (enum); the service accepts the enum.
         return validation_service.validate_with_helpers(payload.type, payload.details)
-    except ValueError as exc:
-        # Defensive: bad enum or schema-level error mapping to 400
+    except ValueError as exc:  # pragma: no cover - defensive path
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
 
 
 # ----------------------------
-# CRUD (persists, uses normalized facts)
+# CRUD (persist normalized facts)
 # ----------------------------
 @router.get("", response_model=list[CitationOut])
 def list_citations(
@@ -200,12 +220,7 @@ def list_citations(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[CitationOut]:
-    """List user's citations, optionally filtered by library/source_type; supports pagination.
-
-    Note:
-        Response model is a flat list for now. If/when you switch to a paged contract,
-        return a Page object (items, total, page, size).
-    """
+    """List user's citations, optionally filtered by library/source_type; supports pagination."""
     try:
         entities = citation_service.list_for_user(
             db,
@@ -215,8 +230,7 @@ def list_citations(
             page=page,
             size=size,
         )
-    except ValueError as exc:
-        # e.g., invalid enum for source_type propagated by service
+    except ValueError as exc:  # pragma: no cover - defensive path
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
@@ -252,12 +266,10 @@ def create_citation(
         )
         return _entity_to_out(entity)
     except LookupError as exc:
-        # e.g., library not found or not owned by user
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
     except ValueError as exc:
-        # e.g., validation errors bubbled up as 400 by service
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
@@ -312,12 +324,10 @@ def update_citation(
         )
         return _entity_to_out(entity)
     except LookupError as exc:
-        # Not found, not owned, or target library not owned by the user
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
     except ValueError as exc:
-        # Validation failure or bad input
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
@@ -341,3 +351,69 @@ def delete_citation(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         ) from exc
+
+
+# ----------------------------
+# M7: Single-citation export
+# ----------------------------
+@router.get(
+    "/{citation_id}/export",
+    summary="Export a single citation (TXT/DOCX/BibTeX/JSON)",
+)
+def export_citation(
+    citation_id: int,
+    export_type: ExportTypeEnum = Query(
+        ...,
+        alias="type",
+        description="Export type: txt | docx | bib | json",
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    """Return a single citation export as an attachment.
+
+    Ownership is enforced by the service/repository layer.
+
+    Query Parameters:
+        type: Export type to generate (txt, docx, bib, json).
+
+    Raises:
+        HTTPException(404): If the citation does not exist or is not owned.
+        HTTPException(400): If an unsupported export type is requested.
+        HTTPException(500): For DOCX dependency errors or unexpected failures.
+    """
+    service = _build_export_service(db)
+
+    try:
+        artifact = service.export_single(
+            user_id=int(user.id),  # type: ignore[attr-defined]
+            citation_id=citation_id,
+            export_type=export_type.value,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except RuntimeError as exc:
+        # E.g., python-docx missing for DOCX exports
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
+        ) from exc
+
+    # Return as a normal Response with a bytes body (avoids StreamingResponse
+    # iterating over bytes → ints and causing encode errors).
+    return Response(
+        content=artifact.content,
+        media_type=artifact.media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact.filename}"',
+            # Security headers for attachments
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+        },
+    )

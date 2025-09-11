@@ -1,4 +1,4 @@
-# citation_generator/app/services/format_service.py
+# app/services/format_service.py
 # pylint: disable=W0718
 """Formatting service for rendering citation strings (M6).
 
@@ -10,6 +10,13 @@ dependency).
 Public API
 ----------
     FormatService.preview(style, source_type, facts) -> str
+    FormatService.format_preview(style, source_type, facts) -> str   # alias
+
+Exports (M7)
+------------
+- Exporters/routes should prefer existing `formatted_text`. If absent,
+  they can call `FormatService.preview(...)` (or `format_preview(...)`)
+  to render deterministically before writing TXT/DOCX/Bib.
 
 Resolution
 ----------
@@ -51,7 +58,6 @@ from app.core.enums import SourceType, Style
 class FormatterProtocol(Protocol):
     """Contract for style-specific formatter implementations."""
 
-    # pylint: disable=too-many-arguments
     def format_book(self, facts: Mapping[str, Any]) -> str:
         """Format a book citation given normalized facts."""
 
@@ -371,6 +377,20 @@ class FormatService:
             return formatter.format_website(facts)
 
         raise ValueError(f"Unsupported source type: {type_enum!s}")
+
+    # Back-compat shim for callers that use `format_preview(...)` (e.g., M6 code paths)
+    def format_preview(
+        self,
+        *,
+        style: Style | str,
+        source_type: SourceType | str,
+        facts: Mapping[str, Any],
+    ) -> str:
+        """Alias to :meth:`preview` (non-breaking convenience).
+
+        This keeps older code (e.g., M6 service calls) working without change.
+        """
+        return self.preview(style=style, source_type=source_type, facts=facts)
 
     # ----------------------------
     # Internals

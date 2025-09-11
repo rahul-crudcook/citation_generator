@@ -1,3 +1,4 @@
+# app/services/citation_service.py
 """Citation service: validate → normalize → persist (with partial update support).
 
 Responsibilities
@@ -11,6 +12,7 @@ Responsibilities
     4) re-normalizing before persist.
 - Enforce row-level ownership for library moves and citation access.
 - (M6) When requested, format and store `formatted_text` using the FormatService.
+- (M7) Provide a stable mapper `to_export_dict(...)` for export services/writers.
 
 Notes
 -----
@@ -23,15 +25,16 @@ request payloads (e.g., "title" → "article_title") to validator expectations.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, MutableMapping, Optional
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional
 
 from sqlalchemy.orm import Session
 
 from app.core.enums import SourceType
 from app.repos.citation_repository import CitationRepository
 from app.repos.library_repository import LibraryRepository
-from app.services.validation_service import ValidationService
 from app.services.format_service import FormatService
+from app.services.validation_service import ValidationService
 
 
 def _authors_norm_to_raw(authors: Any) -> list[str]:
@@ -218,6 +221,9 @@ class CitationService:
     normalization, and optionally a `FormatService` (M6) to produce and store
     deterministic, style-specific `formatted_text`.
 
+    It also exposes `to_export_dict(...)` (M7) to provide a stable, export-
+    friendly mapping from ORM entities to normalized dicts.
+
     Args:
         validator: Optional custom validator instance (useful for tests).
         formatter: Optional custom formatter (useful for tests or advanced configs).
@@ -230,6 +236,65 @@ class CitationService:
     ) -> None:
         self._validator = validator or ValidationService()
         self._formatter = formatter or FormatService()
+
+    # ---------------------------------------------------------------------
+    # M7: Export mapping helpers
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def to_export_dict(entity: Any) -> Dict[str, Any]:
+        """Return a normalized export snapshot for a citation ORM entity.
+
+        Shape:
+            {
+                "id": int | None,
+                "type": str,                # e.g. "book", "journal_article"
+                "facts": dict,              # normalized facts
+                "style": str | None,        # "apa" | "mla" | ...
+                "formatted_text": str | None,
+                "created_at": str | None,   # ISO-8601 string (UTC 'Z' normalized if tz-aware)
+                "updated_at": str | None
+            }
+
+        This avoids leaking storage-specific names (e.g., `facts_jsonb`) and
+        provides a clean interface for export services/writers.
+
+        Args:
+            entity: ORM instance (expected to have attributes: id, source_type/type,
+                facts/facts_jsonb, style, formatted_text, created_at, updated_at).
+
+        Returns:
+            A normalized dict safe for export use.
+        """
+        source_type = getattr(entity, "type", None) or getattr(entity, "source_type", "")
+        facts = (
+            getattr(entity, "facts_jsonb", None)
+            or getattr(entity, "facts", None)
+            or {}
+        )
+        created = getattr(entity, "created_at", None)
+        updated = getattr(entity, "updated_at", None)
+
+        return {
+            "id": getattr(entity, "id", None),
+            "type": str(source_type or ""),
+            "facts": dict(facts) if isinstance(facts, dict) else {},
+            "style": getattr(entity, "style", None),
+            "formatted_text": getattr(entity, "formatted_text", None),
+            "created_at": _iso(created),
+            "updated_at": _iso(updated),
+        }
+
+    @classmethod
+    def to_export_dicts(cls, entities: Iterable[Any]) -> List[Dict[str, Any]]:
+        """Vectorized convenience wrapper for `to_export_dict(...)`.
+
+        Args:
+            entities: Iterable of ORM entities.
+
+        Returns:
+            List of normalized export snapshots.
+        """
+        return [cls.to_export_dict(e) for e in entities]
 
     # ----------------------------
     # Create
@@ -285,11 +350,9 @@ class CitationService:
 
         # Optionally format and persist the preview text.
         if format_now and style:
-            # Compute deterministically; swallow no exceptions here—let them bubble.
             formatted = self._formatter.format_preview(
                 style=style, source_type=source_type, facts=normalized_facts
             )
-            # Update ORM entity and flush for read-your-writes semantics.
             setattr(entity, "formatted_text", formatted)
             db.flush()
 
@@ -372,7 +435,6 @@ class CitationService:
             The updated citation entity.
         """
         uid = user_id
-        # Defensive: tolerate callers passing User instead of user_id.
         if hasattr(user_id, "id"):  # pragma: no cover - defensive
             uid = int(getattr(user_id, "id"))
 
@@ -417,7 +479,6 @@ class CitationService:
                 )
                 setattr(entity, "formatted_text", formatted)
 
-        # Persist changes; flush for in-transaction read-your-writes semantics.
         db.flush()
         return entity
 
@@ -431,6 +492,20 @@ class CitationService:
         if not entity:
             raise LookupError("Citation not found")
         repo.delete(entity)
+
+
+# ---------------------------------------------------------------------
+# Local helper: ISO-8601 normalization (UTC 'Z' suffix if tz-aware)
+# ---------------------------------------------------------------------
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    """Return ISO-8601 string with 'Z' for UTC (if available)."""
+    if not dt:
+        return None
+    try:
+        iso = dt.isoformat()
+        return iso.replace("+00:00", "Z") if iso.endswith("+00:00") else iso
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 # Module-level singleton for app usage (tests may construct their own instance).
