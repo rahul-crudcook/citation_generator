@@ -76,7 +76,7 @@ class TurabianFormatter(BaseFormatter):
         imprint = ", ".join(p for p in (city, publisher, year) if p)
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f"{title}.")
         if imprint:
@@ -102,7 +102,7 @@ class TurabianFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if journal:
@@ -126,7 +126,7 @@ class TurabianFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if site:

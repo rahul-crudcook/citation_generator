@@ -78,7 +78,7 @@ class APAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if year:
             parts.append(f"({year}).")
         if title:
@@ -116,7 +116,7 @@ class APAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if year:
             parts.append(f"({year}).")
         if title:
@@ -144,7 +144,7 @@ class APAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if year:
             parts.append(f"({year}).")
         if title:

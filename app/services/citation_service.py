@@ -13,10 +13,11 @@ Responsibilities
 - Enforce row-level ownership for library moves and citation access.
 - (M6) When requested, format and store `formatted_text` using the FormatService.
 - (M7) Provide a stable mapper `to_export_dict(...)` for export services/writers.
+- (M8) Advanced listing with free-text search/style filters, and bulk ops.
 
 Notes
 -----
-This service is intentionally persistence-oriented. It delegates all validation
+This service is intentionally persistence-oriented. It delegates validation
 and normalization to `ValidationService` to keep a single source of truth for
 rules and messages. Minor key-aliasing is handled here to adapt historical
 request payloads (e.g., "title" → "article_title") to validator expectations.
@@ -359,7 +360,7 @@ class CitationService:
         return entity
 
     # ----------------------------
-    # Read/List
+    # Read/List (M8: query/style filters)
     # ----------------------------
     def list_for_user(
         self,
@@ -368,28 +369,36 @@ class CitationService:
         user_id: int,
         library_id: Optional[int] = None,
         source_type: Optional[str] = None,
+        style: Optional[str] = None,
+        query: Optional[str] = None,
         page: Optional[int] = None,
         size: Optional[int] = None,
     ) -> list[Any]:
-        """List citations for a user (optional filters and pagination).
+        """List citations for a user with optional filters/pagination (delegates to repo).
 
         Args:
             db: DB session.
             user_id: Owner user ID.
             library_id: Optional library filter.
             source_type: Optional source-type filter (string/enum value).
+            style: Optional style filter (e.g., 'apa', 'mla').
+            query: Optional free-text query (title/author/journal/publisher).
             page: Optional page number (1-based).
             size: Optional page size.
 
         Returns:
-            A list of citation entities (repository handles ordering/paging).
+            A list of citation entities (repository handles ordering/paging/search).
         """
-        # M3 note: The repository doesn't yet implement filtering/pagination.
-        # Touch the args to avoid pylint W0613 (unused-argument) until M8 adds support.
-        _ = (source_type, page, size)
-
         repo = CitationRepository(db)
-        return repo.list_for_user(user_id, library_id)
+        return repo.list_for_user(
+            user_id=user_id,
+            library_id=library_id,
+            source_type=source_type,
+            style=style,
+            query=query,
+            page=page,
+            size=size,
+        )
 
     def get_owned(self, db: Session, *, user_id: int, citation_id: int) -> Any:
         """Get a citation if owned by the user; else raise 404.
@@ -492,6 +501,69 @@ class CitationService:
         if not entity:
             raise LookupError("Citation not found")
         repo.delete(entity)
+
+    # ----------------------------
+    # M8: Bulk operations
+    # ----------------------------
+    def bulk_delete(self, db: Session, *, user_id: int, ids: List[int]) -> int:
+        """Delete multiple citations owned by the user.
+
+        Args:
+            db: DB session.
+            user_id: Owner user ID.
+            ids: Non-empty list of citation IDs to delete.
+
+        Returns:
+            Number of rows deleted.
+
+        Raises:
+            ValueError: If `ids` is empty or contains invalid entries.
+        """
+        if not ids:
+            raise ValueError("`ids` must be a non-empty list.")
+        if any((not isinstance(x, int)) or x <= 0 for x in ids):
+            raise ValueError("All `ids` must be positive integers.")
+
+        repo = CitationRepository(db)
+        return int(repo.bulk_delete_for_user(user_id=user_id, ids=ids))
+
+    def bulk_move(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        ids: List[int],
+        library_id: int,
+    ) -> int:
+        """Move multiple citations to a target library (ownership enforced).
+
+        Args:
+            db: DB session.
+            user_id: Owner user ID.
+            ids: Non-empty list of citation IDs to move.
+            library_id: Destination library (must be owned by the user).
+
+        Returns:
+            Number of rows moved.
+
+        Raises:
+            ValueError: If `ids` is empty/invalid or `library_id` is not positive.
+            LookupError: If the library is not found or not owned by user.
+        """
+        if not ids:
+            raise ValueError("`ids` must be a non-empty list.")
+        if any((not isinstance(x, int)) or x <= 0 for x in ids):
+            raise ValueError("All `ids` must be positive integers.")
+        if not isinstance(library_id, int) or library_id <= 0:
+            raise ValueError("`library_id` must be a positive integer.")
+
+        # Ensure the target library is owned by the user.
+        lib_repo = LibraryRepository(db)
+        if lib_repo.get_owned(user_id, library_id) is None:
+            raise LookupError("Library not found")
+
+        repo = CitationRepository(db)
+        return int(repo.bulk_move_for_user(user_id=user_id, ids=ids, library_id=library_id))
 
 
 # ---------------------------------------------------------------------

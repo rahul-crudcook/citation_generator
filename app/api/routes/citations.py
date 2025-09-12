@@ -1,5 +1,5 @@
 # app/api/routes/citations.py
-"""Citation endpoints: discovery, validation (dry-run), CRUD, and export.
+"""Citation endpoints: discovery, validation (dry-run), CRUD, export, and bulk ops.
 
 Scope
 -----
@@ -21,8 +21,14 @@ M6:
 
 M7:
     - `GET /citations/{citation_id}/export?type=docx|txt|bib|json`
-      Streams (now returns as bytes `Response`) a single citation export
-      as an attachment. Ownership enforced.
+      Streams a single citation export as an attachment. Ownership enforced.
+
+M8:
+    - Extend `GET /citations` with advanced filters: `query`, `style`,
+      `source_type`, `library_id`, `page`, `size`.
+    - Bulk actions:
+        * `POST /citations/bulk/delete`  body: {"ids":[...]}
+        * `POST /citations/bulk/move`    body: {"ids":[...], "library_id": ...}
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, get_validation_service  # type: ignore
@@ -64,12 +71,43 @@ class ExportTypeEnum(str, Enum):
     JSON = "json"
 
 
-def _build_export_service(db: Session) -> ExportService:
-    """Create an ExportService instance with its FormatService dependency.
+# ----------------------------
+# Bulk request models (M8)
+# ----------------------------
 
-    Keeping service construction in a small helper isolates wiring and keeps
-    the route handler focused solely on IO concerns (HTTP/streaming).
-    """
+class BulkDeleteIn(BaseModel):
+    """Request payload for bulk deletion of citations."""
+
+    ids: List[int] = Field(..., description="Non-empty list of citation IDs to delete.")
+
+    @field_validator("ids")
+    @classmethod
+    def _validate_ids(cls, value: List[int]) -> List[int]:
+        if not value:
+            raise ValueError("`ids` must be a non-empty list.")
+        if any((not isinstance(x, int)) or x <= 0 for x in value):
+            raise ValueError("All `ids` must be positive integers.")
+        return value
+
+
+class BulkMoveIn(BaseModel):
+    """Request payload for bulk move of citations into a library."""
+
+    ids: List[int] = Field(..., description="Non-empty list of citation IDs to move.")
+    library_id: int = Field(..., ge=1, description="Destination library ID (positive integer).")
+
+    @field_validator("ids")
+    @classmethod
+    def _validate_ids(cls, value: List[int]) -> List[int]:
+        if not value:
+            raise ValueError("`ids` must be a non-empty list.")
+        if any((not isinstance(x, int)) or x <= 0 for x in value):
+            raise ValueError("All `ids` must be positive integers.")
+        return value
+
+
+def _build_export_service(db: Session) -> ExportService:
+    """Create an ExportService instance with its FormatService dependency."""
     fmt = FormatService()
     return ExportService(db=db, format_service=fmt)
 
@@ -77,14 +115,7 @@ def _build_export_service(db: Session) -> ExportService:
 def _entity_to_out(entity: Any) -> Dict[str, Any]:
     """Map an ORM Citation entity to the `CitationOut` shape.
 
-    This function is defensive against minor naming differences that can occur
-    during refactors (e.g., `type` vs `source_type`, `facts` vs `facts_jsonb`).
-
-    Args:
-        entity: ORM instance representing a citation.
-
-    Returns:
-        A dict that conforms to `CitationOut`.
+    Defensive against minor naming differences during refactors.
     """
     return {
         "id": getattr(entity, "id", None),
@@ -106,11 +137,7 @@ def _entity_to_out(entity: Any) -> Dict[str, Any]:
 
 
 def _source_type_label(value: str) -> str:
-    """Generate a human-friendly label for a source type value.
-
-    Example:
-        "journal_article" -> "Journal Article"
-    """
+    """Generate a human-friendly label for a source type value."""
     return value.replace("_", " ").title()
 
 
@@ -124,22 +151,7 @@ def _extract_format_now(
     format_param: Optional[bool],
     format_now_param: Optional[bool],
 ) -> bool:
-    """Determine whether caller requested immediate formatting (M6).
-
-    Resolution priority:
-        1) Explicit query flags: `?format=true|false` or `?format_now=true|false`
-           (the latter wins if both are provided).
-        2) Extra body field `format` or `format_now` (ignored by Pydantic model but
-           available via `model_extra` in Pydantic v2). Either truthy enables formatting.
-
-    Args:
-        payload: The Pydantic model instance received in the body.
-        format_param: Parsed query parameter `format`.
-        format_now_param: Parsed query parameter `format_now`.
-
-    Returns:
-        True if formatting should run immediately.
-    """
+    """Determine whether caller requested immediate formatting (M6)."""
     # Query wins over body.
     if format_now_param is not None:
         return bool(format_now_param)
@@ -154,7 +166,7 @@ def _extract_format_now(
         if "format" in extra:
             return bool(extra.get("format"))
 
-    # Best-effort fallback for environments where extras might be attached to __dict__.
+    # Best-effort fallback where extras might be attached to __dict__.
     dunder = getattr(payload, "__dict__", None)
     if isinstance(dunder, dict):
         if "format_now" in dunder:
@@ -194,12 +206,7 @@ def validate_citation(
     _user: User = Depends(get_current_user),  # require auth to scope to user space
     validation_service: ValidationService = Depends(get_validation_service),
 ) -> ValidationResponse:
-    """Validate raw details against required & format rules for the given source type.
-
-    This endpoint performs a *dry-run*:
-        - It does not write to the database.
-        - It returns a structured payload with helper fields for UX.
-    """
+    """Validate raw details against required & format rules for the given source type."""
     try:
         return validation_service.validate_with_helpers(payload.type, payload.details)
     except ValueError as exc:  # pragma: no cover - defensive path
@@ -213,20 +220,29 @@ def validate_citation(
 # ----------------------------
 @router.get("", response_model=list[CitationOut])
 def list_citations(
-    library_id: Optional[int] = Query(default=None),
-    source_type: Optional[str] = Query(default=None),
-    page: int = Query(1, ge=1),
-    size: int = Query(50, ge=1, le=200),
+    query: Optional[str] = Query(
+        default=None,
+        description="Free-text search across common fields (title/author/journal/publisher).",
+    ),
+    style: Optional[str] = Query(
+        default=None, description="Filter by citation style key (e.g., 'apa')."),
+    source_type: Optional[str] = Query(default=None,
+                                    description="Filter by source type (e.g., 'journal_article')."),
+    library_id: Optional[int] = Query(default=None, description="Filter by owning library id."),
+    page: int = Query(1, ge=1, description="Page number (1-based)."),
+    size: int = Query(50, ge=1, le=200, description="Page size."),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[CitationOut]:
-    """List user's citations, optionally filtered by library/source_type; supports pagination."""
+    """List user's citations with filters & pagination (M8)."""
     try:
         entities = citation_service.list_for_user(
             db,
             user_id=user.id,
             library_id=library_id,
             source_type=source_type,
+            style=style,
+            query=query,
             page=page,
             size=size,
         )
@@ -247,12 +263,7 @@ def create_citation(
     format_q: Optional[bool] = Query(default=None, alias="format"),
     format_now_q: Optional[bool] = Query(default=None, alias="format_now"),
 ) -> CitationOut:
-    """Validate and persist a citation; stores normalized facts.
-
-    If `format=true` (or `format_now=true`) is provided as a query parameter,
-    or an extra body field `format` / `format_now` is present, the service will
-    also compute and persist `formatted_text` immediately (M6).
-    """
+    """Validate and persist a citation; stores normalized facts."""
     try:
         format_now = _extract_format_now(payload, format_q, format_now_q)
         entity = citation_service.create(
@@ -301,16 +312,7 @@ def update_citation(
     format_q: Optional[bool] = Query(default=None, alias="format"),
     format_now_q: Optional[bool] = Query(default=None, alias="format_now"),
 ) -> CitationOut:
-    """Update details/style/library for a citation.
-
-    The service:
-        - merges partial details,
-        - re-validates,
-        - normalizes,
-        - persists,
-        - and (optionally) formats `formatted_text` when requested via the
-          *format-now* toggle.
-    """
+    """Update details/style/library for a citation (with optional format-now)."""
     try:
         format_now = _extract_format_now(payload, format_q, format_now_q)
         entity = citation_service.update(
@@ -354,6 +356,67 @@ def delete_citation(
 
 
 # ----------------------------
+# M8: Bulk operations
+# ----------------------------
+
+@router.post("/bulk/delete", summary="Bulk delete citations", status_code=status.HTTP_200_OK)
+def bulk_delete_citations(
+    payload: BulkDeleteIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, int]:
+    """Delete multiple citations owned by the current user.
+
+    Returns:
+        {"deleted": <count>}
+    """
+    try:
+        deleted = citation_service.bulk_delete(
+            db,
+            user_id=user.id,
+            ids=payload.ids,
+        )
+        return {"deleted": int(deleted)}
+    except ValueError as exc:
+        # Bad IDs or validation issues
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+@router.post("/bulk/move", summary="Bulk move citations to a library",
+             status_code=status.HTTP_200_OK)
+def bulk_move_citations(
+    payload: BulkMoveIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, int]:
+    """Move multiple citations to a target library (must be owned by user).
+
+    Returns:
+        {"moved": <count>}
+    """
+    try:
+        moved = citation_service.bulk_move(
+            db,
+            user_id=user.id,
+            ids=payload.ids,
+            library_id=payload.library_id,
+        )
+        return {"moved": int(moved)}
+    except LookupError as exc:
+        # Library not found or not owned
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except ValueError as exc:
+        # Bad IDs or validation issues
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+# ----------------------------
 # M7: Single-citation export
 # ----------------------------
 @router.get(
@@ -370,18 +433,7 @@ def export_citation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    """Return a single citation export as an attachment.
-
-    Ownership is enforced by the service/repository layer.
-
-    Query Parameters:
-        type: Export type to generate (txt, docx, bib, json).
-
-    Raises:
-        HTTPException(404): If the citation does not exist or is not owned.
-        HTTPException(400): If an unsupported export type is requested.
-        HTTPException(500): For DOCX dependency errors or unexpected failures.
-    """
+    """Return a single citation export as an attachment (ownership enforced)."""
     service = _build_export_service(db)
 
     try:
@@ -404,14 +456,11 @@ def export_citation(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)
         ) from exc
 
-    # Return as a normal Response with a bytes body (avoids StreamingResponse
-    # iterating over bytes → ints and causing encode errors).
     return Response(
         content=artifact.content,
         media_type=artifact.media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{artifact.filename}"',
-            # Security headers for attachments
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
             "Referrer-Policy": "no-referrer",

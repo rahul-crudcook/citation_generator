@@ -1,3 +1,4 @@
+# pylint: disable=invalid-name,no-member
 """create libraries, citations, exports
 
 Revision ID: 20250908_0002

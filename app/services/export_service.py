@@ -1,54 +1,43 @@
 # app/services/export_service.py
-"""Export service for single and bulk citation exports (M7).
+"""Export service for single and bulk citation exports (M7 & M8).
 
 This module implements an OOP service that streams exports in multiple formats:
 TXT, DOCX, BibTeX, and JSON. It is intentionally self-contained so that routes
-can call `ExportService.export_single(...)` or `ExportService.export_library(...)`
-and return a `StreamingResponse` with appropriate headers.
+can call:
 
-Integration points
-------------------
-- Repositories:
-    * CitationRepository: load one citation (owned) and list by library (owned).
-    * LibraryRepository: load a library (owned) for metadata/filename generation.
-- Format service:
-    * Used to render `formatted_text` on-demand if missing in the DB.
+- `ExportService.export_single(...)`        (single citation → bytes)
+- `ExportService.export_library(...)`       (whole library  → bytes)
+- `ExportService.export_library_to_file(...)` (M8 async job → temp file path)
+- `ExportService.export_ids_to_file(...)`     (M8 async job → temp file path)
 
 Design notes
 ------------
 - ExportService does not know about FastAPI; it only returns an `ExportArtifact`
-  (bytes content, media type, and filename).
+  (bytes content, media type, and filename) for streaming endpoints, and returns
+  *file paths* for background jobs (M8).
 - For DOCX, this service tries to import `python-docx` on-demand. If unavailable,
   an explicit `RuntimeError` is raised with an actionable message.
 - For BibTeX export, the mapping is pragmatic (book, journal_article, website).
   You can extend mappings without touching route code.
-
-Usage (in a route)
-------------------
-    artifact = export_service.export_single(user_id, citation_id, "txt")
-    return StreamingResponse(
-        content=io.BytesIO(artifact.content),
-        media_type=artifact.media_type,
-        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
-    )
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, Iterable, List, Literal, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
-# Local imports (repos, services, models)
-from app.services.format_service import FormatService
 from app.repos.citation_repository import CitationRepository
 from app.repos.library_repository import LibraryRepository
+from app.services.format_service import FormatService
 
 # If your models define specific ORM classes you need here, import them:
 # from app.models.citation import Citation
@@ -79,11 +68,11 @@ class _CitationBundle:
 
 
 class ExportService:
-    """Service that provides streaming exports for single and bulk citations."""
+    """Service that provides streaming and file-based exports for citations."""
 
-    # ----------------------------- #
-    # Public API
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
+    # Construction
+    # --------------------------------------------------------------------- #
 
     def __init__(
         self,
@@ -105,6 +94,10 @@ class ExportService:
         self._format_service = format_service
         self._citations = citation_repo or CitationRepository(db)
         self._libraries = library_repo or LibraryRepository(db)
+
+    # --------------------------------------------------------------------- #
+    # Public API (streaming) - M7
+    # --------------------------------------------------------------------- #
 
     def export_single(
         self,
@@ -188,12 +181,11 @@ class ExportService:
         entities = self._citations.list_by_library(user_id=user_id, library_id=library_id)
         bundles = [self._normalize_entity(e) for e in entities]
 
-        # Ensure each bundle has formatted_text; infer a "dominant" style if missing.
         dominant_style = self._resolve_dominant_style(
             bundles, fallback=style_for_heading or "apa"
         )
         for bdl in bundles:
-            # If style missing for preview, use dominant_style for consistent output
+            # Ensure consistent output; fill missing style with dominant one.
             if not bdl.style:
                 bdl.style = dominant_style
             self._ensure_formatted_text(bdl)
@@ -224,9 +216,93 @@ class ExportService:
 
         return ExportArtifact(filename=filename, media_type=media, content=content)
 
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
+    # Public API (file-based for background jobs) - M8
+    # --------------------------------------------------------------------- #
+
+    def export_library_to_file(
+        self,
+        user_id: int,
+        library_id: int,
+        export_type: ExportType,
+        style: Optional[str],
+    ) -> str:
+        """Generate a library export and write it to a temp file.
+
+        This is intended for background jobs (M8). The file path can be returned
+        to clients via a polling endpoint.
+
+        Args:
+            user_id: Owner ID (ownership enforced).
+            library_id: Target library ID.
+            export_type: File type ("txt", "docx", "bib", "json").
+            style: Optional style hint to determine heading or fill missing styles.
+
+        Returns:
+            Absolute path to the created file.
+
+        Raises:
+            Same exceptions as :meth:`export_library`.
+        """
+        artifact = self.export_library(
+            user_id=user_id,
+            library_id=library_id,
+            export_type=export_type,
+            style_for_heading=style,
+        )
+        return _write_temp_file(artifact.content, suffix=f".{export_type}")
+
+    def export_ids_to_file(
+        self,
+        user_id: int,
+        ids: Sequence[int],
+        export_type: ExportType,
+        style: Optional[str],
+    ) -> str:
+        """Generate a bulk export for a specific set of citation IDs to a temp file.
+
+        The method loads only citations owned by the user; unknown/not-owned IDs
+        are silently skipped to keep the job resilient.
+
+        Args:
+            user_id: Owner ID (ownership enforced per-citation).
+            ids: List of citation IDs to export.
+            export_type: File type ("txt", "docx", "bib", "json").
+            style: Optional style hint to use for heading or fill missing styles.
+
+        Returns:
+            Absolute path to the created file.
+
+        Raises:
+            ValueError: If `export_type` is unsupported.
+            RuntimeError: If DOCX is requested without `python-docx`.
+        """
+        bundles = self._load_bundles_for_ids(user_id=user_id, ids=ids)
+
+        dominant_style = self._resolve_dominant_style(bundles, fallback=style or "apa")
+        for bdl in bundles:
+            if not bdl.style:
+                bdl.style = dominant_style
+            self._ensure_formatted_text(bdl)
+
+        if export_type == "txt":
+            heading = self._heading_for_style(dominant_style)
+            content = self._write_txt_bulk(bundles, heading=heading)
+        elif export_type == "json":
+            content = self._write_json_bulk(bundles)
+        elif export_type == "bib":
+            content = self._write_bib_bulk(bundles)
+        elif export_type == "docx":
+            heading = self._heading_for_style(dominant_style)
+            content = self._write_docx_bulk(bundles, heading=heading)
+        else:
+            raise ValueError(f"Unsupported export type: {export_type}")
+
+        return _write_temp_file(content, suffix=f".{export_type}")
+
+    # --------------------------------------------------------------------- #
     # Internals: loading & shaping
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
 
     def _load_owned_citation(self, user_id: int, citation_id: int):
         """Fetch a single citation ensuring row-level ownership."""
@@ -234,6 +310,19 @@ class ExportService:
         if entity is None:
             raise LookupError("Citation not found or not owned by user.")
         return entity
+
+    def _load_bundles_for_ids(self, *, user_id: int, ids: Iterable[int]) -> List[_CitationBundle]:
+        """Load and normalize owned citations for given IDs (skips not found)."""
+        bundles: List[_CitationBundle] = []
+        for cid in ids:
+            try:
+                entity = self._citations.get_by_id_owned(user_id=user_id, citation_id=int(cid))
+            except Exception:  # pylint: disable=broad-except
+                entity = None
+            if entity is None:
+                continue
+            bundles.append(self._normalize_entity(entity))
+        return bundles
 
     @staticmethod
     def _normalize_entity(entity) -> _CitationBundle:
@@ -267,7 +356,6 @@ class ExportService:
         if bundle.formatted_text:
             return
 
-        # Choose a style: prefer the bundle's style; else default to APA.
         style = bundle.style or "apa"
         rendered = self._format_service.preview(
             style=style,
@@ -292,12 +380,11 @@ class ExportService:
                 counts[key] = counts.get(key, 0) + 1
         if not counts:
             return fallback
-        # Return the most frequent style.
         return max(counts.items(), key=lambda kv: kv[1])[0]
 
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
     # Internals: formatting helpers
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
 
     @staticmethod
     def _heading_for_style(style: Optional[str]) -> str:
@@ -325,9 +412,9 @@ class ExportService:
         base = _safe_str(library_name or "library")
         return f"{base}.{ext}"
 
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
     # Writers: TXT / JSON / BIB / DOCX
-    # ----------------------------- #
+    # --------------------------------------------------------------------- #
 
     @staticmethod
     def _write_txt_single(bundle: _CitationBundle) -> bytes:
@@ -335,16 +422,13 @@ class ExportService:
         text = (bundle.formatted_text or "").strip()
         return (text + "\n").encode("utf-8")
 
-    def _write_txt_bulk(
-        self, bundles: List[_CitationBundle], *, heading: str
-    ) -> bytes:
-        """Generate a TXT payload for a library export with heading."""
+    def _write_txt_bulk(self, bundles: List[_CitationBundle], *, heading: str) -> bytes:
+        """Generate a TXT payload for a library/IDs export with heading."""
         lines: List[str] = [heading, ""]
         for bdl in bundles:
             text = (bdl.formatted_text or "").strip()
             if text:
                 lines.append(text)
-        # Blank line between citations for readability.
         payload = "\n\n".join(lines) + "\n"
         return payload.encode("utf-8")
 
@@ -407,9 +491,7 @@ class ExportService:
         return buf.getvalue()
 
     @staticmethod
-    def _write_docx_bulk(
-        bundles: List[_CitationBundle], *, heading: str
-    ) -> bytes:
+    def _write_docx_bulk(bundles: List[_CitationBundle], *, heading: str) -> bytes:
         """Generate DOCX payload for multiple citations with a heading."""
         try:
             from docx import Document  # type: ignore  # pylint: disable=import-outside-toplevel
@@ -441,7 +523,6 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
         return None
     try:
-        # If tz-aware UTC, normalize to 'Z'; otherwise just isoformat.
         iso = dt.isoformat()
         return iso.replace("+00:00", "Z") if iso.endswith("+00:00") else iso
     except Exception:  # pylint: disable=broad-except
@@ -450,9 +531,6 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 
 def _first_author_lastname(facts: Dict) -> Optional[str]:
     """Extract the first author's last name from facts (supports two shapes)."""
-    # Common shapes:
-    #  - facts["authors"] = [{"first": "Jane", "last": "Doe"}, ...]
-    #  - facts["authors"] = ["Doe, Jane", ...]
     authors = facts.get("authors") or []
     if not isinstance(authors, list) or not authors:
         return None
@@ -463,10 +541,8 @@ def _first_author_lastname(facts: Dict) -> Optional[str]:
         return str(last) if last else None
 
     if isinstance(first, str):
-        # Attempt to split "Last, First"
         if "," in first:
             return first.split(",", 1)[0].strip()
-        # Otherwise, pick last token as a pragmatic default
         parts = first.split()
         return parts[-1] if parts else None
     return None
@@ -486,27 +562,18 @@ def _short_title(title: str, max_len: int = 24) -> str:
 def _safe_str(s: str) -> str:
     """ASCII-safe, filename-friendly string (lowercase, hyphenated)."""
     s = str(s or "").strip().lower()
-    # Normalize unicode → ASCII where possible
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    # Replace any non word/space character with space
     s = re.sub(r"[^\w\s-]", " ", s)
-    # Collapse whitespace to single hyphen
     s = re.sub(r"\s+", "-", s)
-    # Collapse multiple hyphens
     s = re.sub(r"-{2,}", "-", s)
     return s.strip("-") or "file"
 
 
 def _to_bibtex_entry(bundle: _CitationBundle) -> str:
-    """Convert a citation bundle to a BibTeX entry string.
-
-    This is a pragmatic mapping that covers the common source types.
-    Extend this mapping as needed for your domain.
-    """
+    """Convert a citation bundle to a BibTeX entry string."""
     source_type = (bundle.source_type or "").lower()
     facts = bundle.facts or {}
 
-    # Decide BibTeX entry type
     if source_type == "book":
         entry_type = "book"
         fields = _bib_fields_book(facts)
@@ -520,12 +587,10 @@ def _to_bibtex_entry(bundle: _CitationBundle) -> str:
         fields = _bib_fields_website(facts)
         key = _bibtex_key_from(facts, fallback="web")
     else:
-        # Reasonable fallback
         entry_type = "misc"
         fields = _bib_fields_generic(facts)
         key = _bibtex_key_from(facts, fallback="ref")
 
-    # Assemble BibTeX text
     field_lines = [f'  {k} = {{{v}}}' for k, v in fields.items() if v]
     return f"@{entry_type}{{{key},\n" + ",\n".join(field_lines) + "\n}"
 
@@ -606,3 +671,31 @@ def _bib_fields_generic(facts: Dict) -> Dict[str, str]:
         "url": str(facts.get("url") or ""),
         "note": str(facts.get("publisher") or facts.get("site_title") or ""),
     }
+
+
+# =============================================================================
+# Local file helper
+# =============================================================================
+
+
+def _write_temp_file(content: bytes, *, suffix: str) -> str:
+    """Write `content` to a secure temporary file and return its absolute path.
+
+    The file is created with `delete=False` so that a background job can expose
+    the resulting path to clients for download later.
+
+    Args:
+        content: The bytes payload to write.
+        suffix: File suffix to use (e.g., ".txt", ".docx").
+
+    Returns:
+        Absolute path to the created temp file.
+    """
+    # Prefer OS temp dir; callers can move it elsewhere if needed.
+    # umask respects system defaults; NamedTemporaryFile handles secure perms.
+    with tempfile.NamedTemporaryFile(prefix="export_", suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        path = tmp.name
+
+    # Resolve to absolute path for clarity when returned via API.
+    return os.path.abspath(path)

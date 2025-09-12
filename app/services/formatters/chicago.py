@@ -74,7 +74,7 @@ class ChicagoFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f"{title}.")
         imprint = ", ".join(p for p in (city, publisher, year) if p)
@@ -101,7 +101,7 @@ class ChicagoFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if journal:
@@ -125,7 +125,7 @@ class ChicagoFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if site:

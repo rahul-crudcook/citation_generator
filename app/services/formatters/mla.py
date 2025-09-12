@@ -80,7 +80,7 @@ class MLAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f"{title}.")
         if publisher:
@@ -107,7 +107,7 @@ class MLAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if journal:
@@ -139,7 +139,7 @@ class MLAFormatter(BaseFormatter):
 
         parts: list[str] = []
         if authors:
-            parts.append(f"{authors}.")
+            parts.append(authors if authors.endswith(".") else f"{authors}.")
         if title:
             parts.append(f'"{title}."')
         if site:
