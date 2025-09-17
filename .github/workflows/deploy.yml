@@ -1,50 +1,49 @@
-name: Deploy to EC2
+name: Deploy to EC2 (self-hosted)
 
 on:
   push:
-    branches:
-      - Milestones   # Trigger when you push to Milestones branch
+    branches: [ Milestones ]
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ec2, linux]
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -e
+      - name: Ensure app dir & sync code
+        run: |
+          mkdir -p "${{ secrets.EC2_APP_DIR }}"
+          rsync -a --delete ./ "${{ secrets.EC2_APP_DIR }}/"
 
-            # Clone repo if missing, else update
-            if [ ! -d "${{ secrets.EC2_APP_DIR }}" ]; then
-              git clone -b Milestones https://github.com/Crudcook/citation_generator.git ${{ secrets.EC2_APP_DIR }}
-            else
-              cd ${{ secrets.EC2_APP_DIR }}
-              git fetch origin Milestones
-              git reset --hard origin/Milestones
-            fi
+      - name: Write .env from GitHub Secrets
+        run: |
+          cat > "${{ secrets.EC2_APP_DIR }}/.env" <<'EOF'
+          APP_NAME=${{ secrets.APP_NAME }}
+          ENV=${{ secrets.ENV }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          JWT_ALG=${{ secrets.JWT_ALG }}
+          ACCESS_TOKEN_EXPIRE_MINUTES=${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
+          REFRESH_TOKEN_EXPIRE_MINUTES=${{ secrets.REFRESH_TOKEN_EXPIRE_MINUTES }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
+          EOF
+          chmod 600 "${{ secrets.EC2_APP_DIR }}/.env"
 
-            cd ${{ secrets.EC2_APP_DIR }}
+      - name: Create/activate venv & install deps
+        working-directory: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          python3 -m venv venv || true
+          . venv/bin/activate
+          pip install --upgrade pip
+          pip install .
+      
+      - name: Run Alembic migrations
+        working-directory: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          . venv/bin/activate
+          alembic upgrade head
 
-            # Setup virtualenv
-            if [ ! -d "venv" ]; then
-              python3 -m venv venv
-            fi
-            source venv/bin/activate
-
-            # Install deps from pyproject.toml
-            pip install --upgrade pip
-            pip install .
-
-            # Run Alembic migrations
-            alembic upgrade head
-
-            # Restart service (will create later)
-            sudo systemctl restart citation.service || true
+      - name: Restart FastAPI service
+        run: sudo systemctl restart citation.service || true
