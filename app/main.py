@@ -22,11 +22,12 @@ Notes
 - For M7/M8, we add the `exports` router (single + bulk export endpoints).
 - No Redis wiring is done here; JWT remains stateless (header and/or cookie).
 """
-
+# pylint: disable=W0718
 from __future__ import annotations
 
+import base64
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -155,6 +156,25 @@ def _include_routers(application: FastAPI) -> None:
         LOGGER.info("Exports routes not found (optional for M7/M8).")
 
 
+def _sanitize_for_json(obj: Any) -> Any:
+    """Recursively convert values so `json.dumps` won't fail.
+
+    - `bytes` → UTF-8 if possible, else base64-wrapped string.
+    - lists/tuples/dicts → sanitize members.
+    - everything else returned as-is.
+    """
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except Exception:  # fall back to base64 if decode fails
+            return {"_bytes_b64": base64.b64encode(obj).decode("ascii")}
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _install_exception_handlers(application: FastAPI) -> None:
     """Register JSON error handlers for common exceptions."""
 
@@ -180,12 +200,31 @@ def _install_exception_handlers(application: FastAPI) -> None:
         logging.getLogger(__name__).debug(
             "Validation error at %s: %s", request.url.path, exc.errors()
         )
+        # Make sure anything inside exc.errors() is safe for JSON (Pydantic can
+        # include raw bytes under the 'input' key on some errors).
+        safe_details = _sanitize_for_json(exc.errors())
         return JSONResponse(
             status_code=422,
             content={
                 "error": True,
                 "message": "Validation error",
-                "details": exc.errors(),
+                "details": safe_details,
+            },
+        )
+
+    # Optional: a last-resort handler to keep responses JSON and avoid HTML errors
+    @application.exception_handler(Exception)
+    async def _unhandled_exception_handler(  # type: ignore[override]
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        logging.getLogger(__name__).exception(
+            "Unhandled exception at %s: %s", request.url.path, exc
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": True,
+                "message": "Internal server error",
             },
         )
 
