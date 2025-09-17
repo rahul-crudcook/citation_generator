@@ -1,0 +1,50 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - Milestones   # Trigger when you push to Milestones branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            # Clone repo if missing, else update
+            if [ ! -d "${{ secrets.EC2_APP_DIR }}" ]; then
+              git clone -b Milestones https://github.com/Crudcook/citation_generator.git ${{ secrets.EC2_APP_DIR }}
+            else
+              cd ${{ secrets.EC2_APP_DIR }}
+              git fetch origin Milestones
+              git reset --hard origin/Milestones
+            fi
+
+            cd ${{ secrets.EC2_APP_DIR }}
+
+            # Setup virtualenv
+            if [ ! -d "venv" ]; then
+              python3 -m venv venv
+            fi
+            source venv/bin/activate
+
+            # Install deps from pyproject.toml
+            pip install --upgrade pip
+            pip install .
+
+            # Run Alembic migrations
+            alembic upgrade head
+
+            # Restart service (will create later)
+            sudo systemctl restart citation.service || true
