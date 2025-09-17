@@ -54,10 +54,19 @@ jobs:
       - name: Create venv & install deps
         working-directory: ${{ secrets.EC2_APP_DIR }}
         run: |
+          # System libs (handy if you ever use psycopg2 instead of -binary)
+          sudo apt-get update -y
+          sudo apt-get install -y libpq-dev build-essential
+
           python -m venv venv
           source venv/bin/activate
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel
+
+          # Install project deps from pyproject.toml
           pip install .
+
+          # Ensure Postgres driver exists
+          pip install "psycopg2-binary>=2.9"
 
       - name: Run Alembic migrations
         working-directory: ${{ secrets.EC2_APP_DIR }}
