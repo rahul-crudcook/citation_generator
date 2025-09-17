@@ -1,25 +1,41 @@
-name: Deploy to EC2 (self-hosted)
+name: "CI/CD: self-hosted deploy"
 
 on:
   push:
-    branches: [ Milestones ]
+    branches:
+      - Milestones
 
 jobs:
   deploy:
-    runs-on: [self-hosted, ec2, linux]
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Ensure app dir & sync code
+      - name: Ensure rsync exists
         run: |
-          mkdir -p "${{ secrets.EC2_APP_DIR }}"
-          rsync -a --delete ./ "${{ secrets.EC2_APP_DIR }}/"
+          if ! command -v rsync >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y rsync
+          fi
 
-      - name: Write .env from GitHub Secrets
+      - name: Ensure target directory exists
         run: |
-          cat > "${{ secrets.EC2_APP_DIR }}/.env" <<'EOF'
+          sudo mkdir -p "${{ secrets.EC2_APP_DIR }}"
+          sudo chown -R "$USER":"$USER" "${{ secrets.EC2_APP_DIR }}"
+
+      - name: Sync code to app dir
+        run: |
+          rsync -a --delete --exclude '.git' ./ "${{ secrets.EC2_APP_DIR }}/"
+
+      - name: Write environment file (.env)
+        working-directory: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          cat > .env <<'EOF'
           APP_NAME=${{ secrets.APP_NAME }}
           ENV=${{ secrets.ENV }}
           SECRET_KEY=${{ secrets.SECRET_KEY }}
@@ -29,21 +45,33 @@ jobs:
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
           EOF
-          chmod 600 "${{ secrets.EC2_APP_DIR }}/.env"
 
-      - name: Create/activate venv & install deps
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create venv & install deps
         working-directory: ${{ secrets.EC2_APP_DIR }}
         run: |
-          python3 -m venv venv || true
-          . venv/bin/activate
-          pip install --upgrade pip
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install --upgrade pip
           pip install .
-      
+
       - name: Run Alembic migrations
         working-directory: ${{ secrets.EC2_APP_DIR }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          . venv/bin/activate
+          source venv/bin/activate
           alembic upgrade head
 
-      - name: Restart FastAPI service
-        run: sudo systemctl restart citation.service || true
+      - name: Restart service if present
+        run: |
+          if systemctl is-enabled --quiet citation.service; then
+            sudo systemctl restart citation.service
+            sudo systemctl status citation.service --no-pager -l || true
+          else
+            echo "ℹ️ systemd service 'citation.service' not found. Create/enable it to auto-start."
+          fi
