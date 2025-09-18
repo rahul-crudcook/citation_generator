@@ -2,12 +2,23 @@ name: "CI/CD: self-hosted deploy"
 
 on:
   push:
-    branches:
-      - Milestones
+    branches: [ Milestones ]
 
 jobs:
   deploy:
     runs-on: self-hosted
+    env:
+      # map secrets -> regular env vars (VS Code linter stops complaining)
+      EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+      APP_NAME: ${{ secrets.APP_NAME }}
+      ENV: ${{ secrets.ENV }}
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
+      JWT_ALG: ${{ secrets.JWT_ALG }}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
+      REFRESH_TOKEN_EXPIRE_MINUTES: ${{ secrets.REFRESH_TOKEN_EXPIRE_MINUTES }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CORS_ORIGINS: ${{ secrets.CORS_ORIGINS }}
+
     defaults:
       run:
         shell: bash
@@ -25,26 +36,30 @@ jobs:
 
       - name: Ensure target directory exists
         run: |
-          sudo mkdir -p "${{ secrets.EC2_APP_DIR }}"
-          sudo chown -R "$USER":"$USER" "${{ secrets.EC2_APP_DIR }}"
+          sudo mkdir -p "$EC2_APP_DIR"
+          sudo chown -R "$USER":"$USER" "$EC2_APP_DIR"
 
       - name: Sync code to app dir
         run: |
-          rsync -a --delete --exclude '.git' ./ "${{ secrets.EC2_APP_DIR }}/"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'venv' \
+            ./ "$EC2_APP_DIR/"
 
       - name: Write environment file (.env)
-        working-directory: ${{ secrets.EC2_APP_DIR }}
+        working-directory: ${{ env.EC2_APP_DIR }}
         run: |
-          cat > .env <<'EOF'
-          APP_NAME=${{ secrets.APP_NAME }}
-          ENV=${{ secrets.ENV }}
-          SECRET_KEY=${{ secrets.SECRET_KEY }}
-          JWT_ALG=${{ secrets.JWT_ALG }}
-          ACCESS_TOKEN_EXPIRE_MINUTES=${{ secrets.ACCESS_TOKEN_EXPIRE_MINUTES }}
-          REFRESH_TOKEN_EXPIRE_MINUTES=${{ secrets.REFRESH_TOKEN_EXPIRE_MINUTES }}
-          DATABASE_URL=${{ secrets.DATABASE_URL }}
-          CORS_ORIGINS=${{ secrets.CORS_ORIGINS }}
+          cat > .env <<EOF
+          APP_NAME=$APP_NAME
+          ENV=$ENV
+          SECRET_KEY=$SECRET_KEY
+          JWT_ALG=$JWT_ALG
+          ACCESS_TOKEN_EXPIRE_MINUTES=$ACCESS_TOKEN_EXPIRE_MINUTES
+          REFRESH_TOKEN_EXPIRE_MINUTES=$REFRESH_TOKEN_EXPIRE_MINUTES
+          DATABASE_URL=$DATABASE_URL
+          CORS_ORIGINS=$CORS_ORIGINS
           EOF
+          chmod 600 .env
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -52,9 +67,11 @@ jobs:
           python-version: '3.12'
 
       - name: Create venv & install deps
-        working-directory: ${{ secrets.EC2_APP_DIR }}
+        working-directory: ${{ env.EC2_APP_DIR }}
+        env:
+          PIP_NO_CACHE_DIR: "1"
+          PYTHONUNBUFFERED: "1"
         run: |
-          # System libs (handy if you ever use psycopg2 instead of -binary)
           sudo apt-get update -y
           sudo apt-get install -y libpq-dev build-essential
 
@@ -62,16 +79,16 @@ jobs:
           source venv/bin/activate
           python -m pip install --upgrade pip wheel
 
-          # Install project deps from pyproject.toml
-          pip install .
+          # DB driver first (pinned)
+          pip install "psycopg2-binary==2.9.10"
 
-          # Ensure Postgres driver exists
-          pip install "psycopg2-binary>=2.9"
+          # Project deps from pyproject.toml
+          pip install --upgrade .
 
       - name: Run Alembic migrations
-        working-directory: ${{ secrets.EC2_APP_DIR }}
+        working-directory: ${{ env.EC2_APP_DIR }}
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL: ${{ env.DATABASE_URL }}
         run: |
           source venv/bin/activate
           alembic upgrade head
@@ -81,6 +98,7 @@ jobs:
           if systemctl is-enabled --quiet citation.service; then
             sudo systemctl restart citation.service
             sudo systemctl status citation.service --no-pager -l || true
+            sudo journalctl -u citation.service -n 50 --no-pager || true
           else
             echo "ℹ️ systemd service 'citation.service' not found. Create/enable it to auto-start."
           fi
