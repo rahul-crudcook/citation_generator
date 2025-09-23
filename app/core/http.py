@@ -1,5 +1,6 @@
 # app/core/http.py
 # pylint: disable= W0611
+# pylint: disable=W0718
 """
 Async HTTP client abstraction for fetchers/services.
 
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional, Protocol, Sequence, Tuple, cast
 from urllib.parse import urlsplit
 
@@ -37,11 +38,23 @@ except Exception:  # pylint: disable=broad-except
 
 @dataclass(frozen=True)
 class HttpResponse:
-    """Lightweight HTTP response shape consumed by fetchers."""
+    """Lightweight HTTP response shape consumed by fetchers.
+
+    Attributes:
+        status_code: Integer HTTP status (e.g., 200, 404, 429).
+        text: Raw response body as text.
+        _json: Optional pre-parsed JSON (if detected and parsed successfully).
+        headers: **Normalized** response headers as a plain dict with
+                 **lowercase keys** (e.g., "content-type", "retry-after").
+                 Exposing headers allows callers to read upstream hints like
+                 rate-limiting ("Retry-After") without depending on the
+                 underlying HTTP client's response type.
+    """
 
     status_code: int
     text: str
     _json: Optional[Any] = None
+    headers: Dict[str, str] = field(default_factory=dict)
 
     def json(self) -> Any:
         """Return cached JSON if present, else attempt to parse from text.
@@ -58,7 +71,12 @@ class HttpResponse:
 
 
 class AsyncHttpClientProtocol(Protocol):
-    """Tiny async HTTP client protocol for dependency inversion."""
+    """Tiny async HTTP client protocol for dependency inversion.
+
+    Implementations must return `HttpResponse` so callers can access
+    `status_code`, `headers`, and `json()` uniformly, regardless of the
+    underlying HTTP library.
+    """
 
     async def get(
         self,
@@ -223,8 +241,18 @@ class AsyncHttpClient(AsyncHttpClientProtocol):
 
     @staticmethod
     def _to_http_response(resp: Any) -> HttpResponse:
-        """Convert an httpx response to our lightweight HttpResponse."""
+        """Convert an httpx response to our lightweight HttpResponse.
+
+        Notes:
+            * We normalize headers to a dict **with lowercase keys** to make
+              callers' header lookups case-insensitive and library-agnostic.
+            * We opportunistically cache parsed JSON into `_json` when the
+              server declares `application/json`. Callers may still call
+              `json()` which will return the cached value or parse on demand.
+        """
         content_text = resp.text
+
+        # Opportunistic JSON parsing (only when content-type advertises JSON).
         parsed_json: Optional[Any]
         try:
             if "application/json" in (resp.headers.get("content-type") or ""):
@@ -233,10 +261,18 @@ class AsyncHttpClient(AsyncHttpClientProtocol):
                 parsed_json = None
         except ValueError:
             parsed_json = None
+
+        # Normalize headers to a plain dict[str, str] with lowercase keys.
+        try:
+            headers_dict = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+        except Exception:
+            headers_dict = {}
+
         return HttpResponse(
             status_code=cast(int, resp.status_code),
             text=content_text,
             _json=parsed_json,
+            headers=headers_dict,
         )
 
 

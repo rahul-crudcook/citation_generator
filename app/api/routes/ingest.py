@@ -21,7 +21,9 @@ Lint/Style:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
+import logging
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -34,6 +36,18 @@ router = APIRouter(
     prefix="/ingest",
     tags=["ingest"],
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _retry_after_from_message(message: str) -> Optional[str]:
+    """Extract a Retry-After seconds hint from an upstream error message.
+
+    The fetchers may raise messages like: "OpenLibrary HTTP 429 (Retry-After=60)".
+    This helper pulls out the numeric value if present, otherwise returns None.
+    """
+    match = re.search(r"Retry-After=(\d+)", message)
+    return match.group(1) if match else None
 
 
 class IngestController:
@@ -75,6 +89,10 @@ class IngestController:
             HTTPException: 400 when the link is malformed/unsupported or when
                 validation fails at the service layer; 503 when an upstream
                 dependency is temporarily unavailable.
+            HTTPException: 429 when an upstream dependency rate-limits the
+                request (e.g., OpenLibrary/Crossref); may include Retry-After.
+            HTTPException: 404 when the upstream reports the resource is not
+                found (e.g., unknown DOI/ISBN).
         """
         try:
             result = await self._ingest_service.ingest_link(
@@ -87,9 +105,33 @@ class IngestController:
                 detail=str(exc),
             ) from exc
         except RuntimeError as exc:  # Upstream issues / timeouts surfaced by service
+            # We classify common upstream statuses (429/404) to avoid masking them
+            # as generic 503s. Anything else remains a 503.
+            msg = str(exc)
+            logger.error("ingest/link failed: %s", msg, exc_info=True)
+
+            low = msg.lower()
+            # Rate limit (Too Many Requests)
+            if "http 429" in low or "rate limit" in low:
+                retry_after = _retry_after_from_message(msg)
+                headers = {"Retry-After": retry_after} if retry_after else None
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=msg,
+                    headers=headers,
+                ) from exc
+
+            # Not found (e.g., unknown ISBN/DOI upstream)
+            if "http 404" in low or "not found" in low:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=msg,
+                ) from exc
+
+            # Default: service unavailable
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=str(exc),
+                detail=msg,
             ) from exc
 
         # The service returns a domain result. Adapt it to the API schema.
